@@ -50,9 +50,156 @@ local state = {
 
 -- ─── Helpers ────────────────────────────────────────────────────────
 local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local LP = Players.LocalPlayer
 local mouse = LP:GetMouse()
 local Camera = workspace.CurrentCamera
+
+-- ─── TankInfo loader ────────────────────────────────────────────────
+-- Reads ReplicatedStorage.TankInfo, builds a lookup table:
+--   tankData[tankName] = { armor = {hull, turret, side, rear}, weakPoints = {...} }
+local tankData = {}
+local tankInfoRoot = nil
+
+local function readNumValue(parent, name)
+    local v = parent:FindFirstChild(name)
+    if v and v:IsA("NumberValue") then return v.Value end
+    if v and v:IsA("IntValue") then return v.Value end
+    -- attribute fallback
+    local a = parent:GetAttribute(name)
+    if type(a) == "number" then return a end
+    return nil
+end
+
+local function readStringValue(parent, name)
+    local v = parent:FindFirstChild(name)
+    if v and v:IsA("StringValue") then return v.Value end
+    local a = parent:GetAttribute(name)
+    if type(a) == "string" then return a end
+    return nil
+end
+
+local function extractTankEntry(node)
+    local entry = { name = node.Name, raw = node, armor = {}, weakPoints = {}, weapons = {} }
+
+    -- ModuleScript form: require() and inspect returned table
+    if node:IsA("ModuleScript") then
+        local ok, data = pcall(require, node)
+        if ok and type(data) == "table" then
+            for k, v in pairs(data) do
+                local lk = string.lower(tostring(k))
+                if type(v) == "number" then
+                    entry.armor[lk] = v
+                elseif type(v) == "string" then
+                    entry.armor[lk] = v
+                elseif type(v) == "table" then
+                    if lk:find("weak") or lk:find("crit") then
+                        for _, partName in pairs(v) do
+                            if type(partName) == "string" then
+                                table.insert(entry.weakPoints, partName)
+                            end
+                        end
+                    elseif lk:find("armor") or lk:find("plate") then
+                        for kk, vv in pairs(v) do entry.armor[string.lower(tostring(kk))] = vv end
+                    end
+                end
+            end
+        end
+        return entry
+    end
+
+    -- Folder / Configuration / Model form: enumerate children & attributes
+    for _, c in ipairs(node:GetChildren()) do
+        local cname = string.lower(c.Name)
+        if c:IsA("NumberValue") or c:IsA("IntValue") then
+            entry.armor[cname] = c.Value
+        elseif c:IsA("StringValue") then
+            entry.armor[cname] = c.Value
+        elseif c:IsA("Folder") or c:IsA("Configuration") then
+            if cname:find("weak") or cname:find("crit") then
+                for _, wp in ipairs(c:GetChildren()) do
+                    table.insert(entry.weakPoints, wp.Name)
+                end
+            elseif cname:find("armor") or cname:find("plate") then
+                for _, av in ipairs(c:GetChildren()) do
+                    if av:IsA("NumberValue") or av:IsA("IntValue") then
+                        entry.armor[string.lower(av.Name)] = av.Value
+                    end
+                end
+            elseif cname:find("weapon") or cname:find("gun") then
+                for _, w in ipairs(c:GetChildren()) do
+                    table.insert(entry.weapons, w.Name)
+                end
+            end
+        end
+    end
+
+    -- attribute pass
+    for k, v in pairs(node:GetAttributes()) do
+        local lk = string.lower(k)
+        if type(v) == "number" then entry.armor[lk] = v end
+    end
+
+    return entry
+end
+
+local function loadTankInfo()
+    tankInfoRoot = ReplicatedStorage:FindFirstChild("TankInfo")
+    if not tankInfoRoot then
+        print("[MTC4] TankInfo not found in ReplicatedStorage")
+        return
+    end
+    local count = 0
+    for _, node in ipairs(tankInfoRoot:GetChildren()) do
+        local ok, entry = pcall(extractTankEntry, node)
+        if ok and entry then
+            tankData[entry.name] = entry
+            -- also key by lowercase + spaceless variants for flexible matching
+            tankData[string.lower(entry.name)] = entry
+            tankData[entry.name:gsub("%s+", "")] = entry
+            count = count + 1
+        end
+    end
+    print(string.format("[MTC4] TankInfo loaded · %d entries", count))
+    if count > 0 then
+        -- print first 3 entries as a sample so we know the shape is right
+        local shown = 0
+        for k, v in pairs(tankData) do
+            if shown < 3 and k == v.name then
+                local armorParts = {}
+                for ak, av in pairs(v.armor) do
+                    table.insert(armorParts, string.format("%s=%s", ak, tostring(av)))
+                    if #armorParts >= 4 then break end
+                end
+                print(string.format("  [%s] armor:{%s}  weakpts:%d  weapons:%d",
+                    k, table.concat(armorParts, " "), #v.weakPoints, #v.weapons))
+                shown = shown + 1
+            end
+        end
+    end
+end
+loadTankInfo()
+
+-- Resolve which TankInfo entry an enemy is using
+-- Strategy: check the vehicle model's name, then any string-value tags, then attributes
+local function getTankEntry(vehicleModel)
+    if not vehicleModel then return nil end
+    local candidates = { vehicleModel.Name }
+    -- common tag spots
+    local tag = readStringValue(vehicleModel, "TankType")
+            or readStringValue(vehicleModel, "Type")
+            or readStringValue(vehicleModel, "Model")
+            or vehicleModel:GetAttribute("TankType")
+            or vehicleModel:GetAttribute("Tank")
+            or vehicleModel:GetAttribute("Model")
+    if type(tag) == "string" then table.insert(candidates, tag) end
+    for _, c in ipairs(candidates) do
+        if tankData[c] then return tankData[c] end
+        if tankData[string.lower(c)] then return tankData[string.lower(c)] end
+        if tankData[c:gsub("%s+", "")] then return tankData[c:gsub("%s+", "")] end
+    end
+    return nil
+end
 
 local function safeNotify(msg, title, dur)
     if notify then pcall(function() notify(msg, title, dur) end) end
@@ -174,10 +321,19 @@ local function newEspEntry()
     local weakDot = newDraw("Circle")
     weakDot.Filled = true; weakDot.Radius = 4; weakDot.NumSides = 12
     weakDot.Color = Color3.fromRGB(255, 200, 60); weakDot.ZIndex = 22; weakDot.Visible = false
+    local armorTxt = newDraw("Text")
+    armorTxt.Size = 10; armorTxt.Font = Drawing.Fonts.Monospace
+    armorTxt.Center = true; armorTxt.Outline = true; armorTxt.ZIndex = 21; armorTxt.Visible = false
+    armorTxt.Color = Color3.fromRGB(180, 220, 255)
+    local tankTxt = newDraw("Text")
+    tankTxt.Size = 10; tankTxt.Font = Drawing.Fonts.Monospace
+    tankTxt.Center = true; tankTxt.Outline = true; tankTxt.ZIndex = 21; tankTxt.Visible = false
+    tankTxt.Color = Color3.fromRGB(255, 200, 60)
 
     return {
         box=box, boxOut=boxOut, name=nameTxt, dist=distTxt,
-        hpBg=hpBarBg, hp=hpBar, line=snapLine, weakDot=weakDot
+        hpBg=hpBarBg, hp=hpBar, line=snapLine, weakDot=weakDot,
+        armor=armorTxt, tank=tankTxt
     }
 end
 
@@ -195,6 +351,8 @@ local function hideEspEntry(e)
     e.hp.Visible = false
     e.line.Visible = false
     e.weakDot.Visible = false
+    e.armor.Visible = false
+    e.tank.Visible = false
 end
 
 -- ─── Enemy enumeration ──────────────────────────────────────────────
@@ -245,25 +403,65 @@ local function gatherEnemies()
     return out
 end
 
--- Heuristic weak-point: turret ring / commander hatch / engine deck
--- We probe by name (common in tank games) and fall back to "slightly above HRP" (turret roof)
+-- Weak-point lookup. Priority:
+--   1. TankInfo entry's weakPoints list (the real game data we just loaded)
+--   2. Common tank-game part names as fallback
+--   3. Turret roof estimate above HRP
 local function findWeakPoint(enemy)
     if not enemy.vehicle then
         return enemy.hrp.Position + Vector3.new(0, 1.5, 0)
     end
+
+    -- (1) TankInfo-driven weak points
+    local entry = getTankEntry(enemy.vehicle)
+    if entry and entry.weakPoints and #entry.weakPoints > 0 then
+        for _, wpName in ipairs(entry.weakPoints) do
+            local part = enemy.vehicle:FindFirstChild(wpName, true)
+            if part and part:IsA("BasePart") then return part.Position end
+        end
+    end
+
+    -- (2) heuristic part-name probe
     local candidates = {
         "TurretRing", "Turret_Ring", "Cupola", "CommanderHatch", "Hatch",
         "Commander", "EngineDeck", "Engine", "AmmoRack", "Crew",
+        "DriverHatch", "GunMantlet", "MGPort", "PeriscopeLow",
     }
     for _, n in ipairs(candidates) do
         local part = enemy.vehicle:FindFirstChild(n, true)
         if part and part:IsA("BasePart") then return part.Position end
     end
-    -- fallback: turret roof estimate
+
+    -- (3) fallback: turret roof estimate
     if enemy.vehicle.PrimaryPart then
         return enemy.vehicle.PrimaryPart.Position + Vector3.new(0, 2.5, 0)
     end
     return enemy.hrp.Position + Vector3.new(0, 2, 0)
+end
+
+-- Format an armor summary string from a TankInfo entry for ESP display
+local function armorSummary(entry)
+    if not entry or not entry.armor then return nil end
+    local order = { "hull", "turret", "side", "rear", "hullarmor", "turretarmor", "sidearmor", "rearArmor" }
+    local parts = {}
+    for _, k in ipairs(order) do
+        local v = entry.armor[k]
+        if v and tonumber(v) then
+            local short = k:gsub("armor", "")
+            table.insert(parts, string.format("%s:%d", short:sub(1,1):upper()..short:sub(2), math.floor(v)))
+        end
+    end
+    -- if none of the standard names matched, just grab the first few numeric armor values
+    if #parts == 0 then
+        for k, v in pairs(entry.armor) do
+            if tonumber(v) and not k:find("price") and not k:find("speed") then
+                table.insert(parts, string.format("%s:%s", k:sub(1,3):upper(), tostring(v)))
+                if #parts >= 3 then break end
+            end
+        end
+    end
+    if #parts == 0 then return nil end
+    return table.concat(parts, " ")
 end
 
 -- Bounding box of a model on screen (project min/max corners)
@@ -344,6 +542,21 @@ local function renderESP(enemies)
                 e.dist.Text     = string.format("%d m", math.floor(en.distance + 0.5))
                 e.dist.Color    = Color3.fromRGB(220, 220, 220)
                 e.dist.Visible  = true
+            end
+
+            -- TankInfo-driven labels: tank name + armor summary
+            local entry = getTankEntry(en.vehicle)
+            if entry then
+                e.tank.Position = Vector2.new(boxX + boxW/2, boxY - 28)
+                e.tank.Text     = entry.name
+                e.tank.Visible  = true
+
+                local armorStr = armorSummary(entry)
+                if armorStr then
+                    e.armor.Position = Vector2.new(boxX + boxW/2, boxY + boxH + 14)
+                    e.armor.Text     = armorStr
+                    e.armor.Visible  = true
+                end
             end
 
             if CONFIG.showHealthBars and en.maxHealth and en.maxHealth > 0 then
