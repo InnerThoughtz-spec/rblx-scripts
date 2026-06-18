@@ -18,38 +18,37 @@ local PATCH_TARGETS = {
         target      = 9999,
         active      = true,
         patched     = {}, origPatched = {},
-        names       = { "Penetration", "Penetrate", "Pen" },
+        names       = { "Penetration","Penetrate","Pen","AP","ArmorPen","PenValue","PenLevel" },
     },
     Ricochet = {
         target      = 9999,
         active      = true,
         patched     = {}, origPatched = {},
-        names       = { "RicochetAngle", "Ricochet", "RicoAngle" },
+        names       = { "RicochetAngle","Ricochet","RicoAngle","AngleRicochet","RicAngle" },
     },
     BulletGravity = {
         target      = 0,
         active      = true,
         patched     = {}, origPatched = {},
-        names       = { "BulletGravity", "Gravity", "ShellGravity" },
+        names       = { "BulletGravity","Gravity","ShellGravity","ProjectileGravity","ShellDrop","Drop" },
     },
     ShellSpeed = {
         target      = 9999,
         active      = true,
         patched     = {}, origPatched = {},
-        names       = { "ShellSpeed", "MuzzleVelocity", "Velocity", "ShellVel" },
+        names       = { "ShellSpeed","MuzzleVelocity","Velocity","ShellVel","ProjectileSpeed","ShellVelocity","MuzzleVel" },
     },
-    -- bonus: also smash any obvious damage / reload values we encounter
     Damage = {
         target      = 9999,
         active      = false,
         patched     = {}, origPatched = {},
-        names       = { "Damage", "BaseDamage", "Dmg" },
+        names       = { "Damage","BaseDamage","Dmg","DamageValue","HPDamage" },
     },
     Reload = {
         target      = 0.1,
         active      = false,
         patched     = {}, origPatched = {},
-        names       = { "ReloadTime", "Reload" },
+        names       = { "ReloadTime","Reload","ReloadSpeed","ReloadDuration" },
     },
 }
 
@@ -72,6 +71,39 @@ local function setCorner(d, r) pcall(function() d.Corner = r end) end
 local function isPatchableValue(inst)
     return inst:IsA("NumberValue") or inst:IsA("IntValue")
         or inst:IsA("NumberConstrainedValue")
+end
+
+-- Walks a Lua table returned from a ModuleScript and overwrites every
+-- numeric field whose key matches any PATCH_TARGET name.
+local function patchModuleTable(modScript, returned, target, depth)
+    depth = depth or 0
+    if depth > 6 then return 0 end
+    if type(returned) ~= "table" then return 0 end
+    local count = 0
+    local nameSet = {}
+    for _, n in ipairs(target.names) do
+        nameSet[n] = true
+        nameSet[string.lower(n)] = true
+        nameSet[string.upper(n)] = true
+    end
+    for k, v in pairs(returned) do
+        local ks = tostring(k)
+        if nameSet[ks] or nameSet[string.lower(ks)] then
+            if type(v) == "number" then
+                local key = "mod:" .. tostring(modScript) .. ":" .. ks .. ":" .. tostring(depth)
+                if target.origPatched[key] == nil then
+                    target.origPatched[key] = v
+                end
+                returned[k] = target.target
+                target.patched[key] = { tbl = returned, key = k }
+                count = count + 1
+            end
+        end
+        if type(v) == "table" then
+            count = count + patchModuleTable(modScript, v, target, depth + 1)
+        end
+    end
+    return count
 end
 
 -- Also let us flip numeric Attributes (MTC4 may store stats as attributes)
@@ -144,6 +176,7 @@ end
 -- ────────────────────────────────────────────────────────────────────
 local function applyPatches()
     local count = 0
+    local moduleHits = 0
     for _, root in ipairs(state.scanRoots) do
         if root and root.Parent then
             for _, target in pairs(PATCH_TARGETS) do
@@ -164,7 +197,7 @@ local function applyPatches()
                             target.patched[inst] = true
                             count = count + 1
                         end
-                        -- attribute match (any instance can have numeric attributes)
+                        -- attribute match
                         for _, name in ipairs(target.names) do
                             local av = inst:GetAttribute(name)
                             if type(av) == "number" then
@@ -177,22 +210,38 @@ local function applyPatches()
                                 count = count + 1
                             end
                         end
+                        -- ModuleScript match: require + walk table
+                        if inst:IsA("ModuleScript") then
+                            local ok, ret = pcall(require, inst)
+                            if ok and type(ret) == "table" then
+                                local n = patchModuleTable(inst, ret, target)
+                                count = count + n
+                                moduleHits = moduleHits + n
+                            end
+                        end
                     end
                 end
             end
         end
     end
     state.lastScanCount = count
+    state.lastModuleHits = moduleHits
 end
 
 local function restoreAll()
     for _, target in pairs(PATCH_TARGETS) do
         for k, v in pairs(target.patched) do
             if type(k) == "string" and type(v) == "table" then
-                -- attribute restore
-                local orig = target.origPatched[k]
-                if orig ~= nil and v.inst and v.inst.Parent then
-                    pcall(function() v.inst:SetAttribute(v.attr, orig) end)
+                if v.tbl and v.key ~= nil then
+                    -- module-table restore
+                    local orig = target.origPatched[k]
+                    if orig ~= nil then v.tbl[v.key] = orig end
+                elseif v.inst and v.attr then
+                    -- attribute restore
+                    local orig = target.origPatched[k]
+                    if orig ~= nil and v.inst.Parent then
+                        pcall(function() v.inst:SetAttribute(v.attr, orig) end)
+                    end
                 end
             else
                 -- value-instance restore
@@ -374,3 +423,49 @@ LP.CharacterRemoving:Connect(function() restoreAll() end)
 safeNotify("MTC4 patcher armed · F5–F10 toggle · F4 refresh · F2 close", "matcha", 5)
 print("[MTC4P] armed. PATCH_TARGETS hot — scanning ReplicatedStorage.TankInfo + LP vehicle.")
 print("[MTC4P] hotkeys: F5=Pen F6=Rico F7=Grav F8=Spd F9=Dmg F10=Rld · F4=refresh F2=close")
+
+-- ────────────────────────────────────────────────────────────────────
+-- DIAGNOSTIC: dump the first TankInfo child's structure so we can see
+-- exactly what MTC4 stores and how, in case the patcher misses it.
+-- ────────────────────────────────────────────────────────────────────
+spawn(function()
+    wait(2)  -- give the patcher one cycle to seed
+    local ti = ReplicatedStorage:FindFirstChild("TankInfo")
+    if not ti then print("[MTC4P] TankInfo missing"); return end
+    print("[MTC4P] === TankInfo dump (first 2 children) ===")
+    local n = 0
+    for _, child in ipairs(ti:GetChildren()) do
+        n = n + 1
+        if n > 2 then break end
+        print(string.format("  [%d] %s  (ClassName=%s)", n, child.Name, child.ClassName))
+        if child:IsA("ModuleScript") then
+            local ok, ret = pcall(require, child)
+            print("       require ok=" .. tostring(ok) .. "  type=" .. type(ret))
+            if ok and type(ret) == "table" then
+                local m = 0
+                for k, v in pairs(ret) do
+                    m = m + 1
+                    if m > 15 then print("       ...(truncated)"); break end
+                    print(string.format("       .%s = %s  (%s)", tostring(k), tostring(v), type(v)))
+                end
+            end
+        else
+            local m = 0
+            for _, sub in ipairs(child:GetChildren()) do
+                m = m + 1
+                if m > 15 then print("       ...(truncated)"); break end
+                local val = ""
+                if sub:IsA("NumberValue") or sub:IsA("IntValue") or sub:IsA("StringValue") then
+                    val = " = " .. tostring(sub.Value)
+                end
+                print(string.format("       %s  (%s)%s", sub.Name, sub.ClassName, val))
+            end
+            local attrs = child:GetAttributes()
+            for k, v in pairs(attrs) do
+                print(string.format("       @%s = %s  (%s)", tostring(k), tostring(v), type(v)))
+            end
+        end
+    end
+    print("[MTC4P] === end TankInfo dump ===")
+    print("[MTC4P] last scan: " .. tostring(state.lastScanCount) .. " values · module hits: " .. tostring(state.lastModuleHits or 0))
+end)
