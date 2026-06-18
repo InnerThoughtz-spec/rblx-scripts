@@ -218,18 +218,18 @@ local function newDraw(kind)
     return d
 end
 
-local HUD_X, HUD_Y, HUD_W = 20, 20, 280
+local HUD_X, HUD_Y, HUD_W = 20, 260, 300
 
 hud.bg = newDraw("Square")
 hud.bg.Color = Color3.fromRGB(12, 14, 18); hud.bg.Filled = true
-hud.bg.Transparency = 0.86; hud.bg.ZIndex = 10; hud.bg.Visible = true
+hud.bg.Transparency = 0.92; hud.bg.ZIndex = 998; hud.bg.Visible = true
 hud.bg.Size = Vector2.new(HUD_W, 168)
 hud.bg.Position = Vector2.new(HUD_X, HUD_Y)
 setCorner(hud.bg, 10)
 
 hud.accent = newDraw("Square")
 hud.accent.Color = Color3.fromRGB(110, 230, 130); hud.accent.Filled = true
-hud.accent.Transparency = 1; hud.accent.ZIndex = 11; hud.accent.Visible = true
+hud.accent.Transparency = 1; hud.accent.ZIndex = 999; hud.accent.Visible = true
 hud.accent.Size = Vector2.new(4, 168)
 hud.accent.Position = Vector2.new(HUD_X, HUD_Y)
 
@@ -237,14 +237,14 @@ hud.title = newDraw("Text")
 hud.title.Text = "MTC4 PATCHER · matcha"
 hud.title.Size = 15; hud.title.Font = Drawing.Fonts.SystemBold
 hud.title.Color = Color3.fromRGB(240, 240, 245)
-hud.title.ZIndex = 12; hud.title.Visible = true
+hud.title.ZIndex = 1000; hud.title.Visible = true; hud.title.Outline = true
 hud.title.Position = Vector2.new(HUD_X + 14, HUD_Y + 8)
 
 local function mkLine(dy, init)
     local t = newDraw("Text")
     t.Size = 12; t.Font = Drawing.Fonts.Monospace
     t.Color = Color3.fromRGB(210, 215, 220)
-    t.ZIndex = 12; t.Visible = true
+    t.ZIndex = 999; t.Visible = true; t.Outline = true
     t.Position = Vector2.new(HUD_X + 14, HUD_Y + dy)
     t.Text = init or ""
     return t
@@ -257,8 +257,8 @@ hud.lineSpd  = mkLine(80, "")
 hud.lineDmg  = mkLine(96, "")
 hud.lineRld  = mkLine(112, "")
 hud.lineStat = mkLine(132, "")
-hud.lineHint = mkLine(150, "1/2/3/4 toggle · 5/6 dmg/reload · R refresh · X close")
-hud.lineHint.Color = Color3.fromRGB(130, 140, 150)
+hud.lineHint = mkLine(150, "F5/6/7/8 toggle · F9/F10 dmg/rld · F4 refresh · F2 close")
+hud.lineHint.Color = Color3.fromRGB(160, 170, 180)
 hud.lineHint.Size = 10
 
 local function paintHud()
@@ -273,12 +273,12 @@ local function paintHud()
             ln.Color = Color3.fromRGB(180, 110, 110)
         end
     end
-    lineFor("Penetration",   hud.linePen,  "1 PEN")
-    lineFor("Ricochet",      hud.lineRic,  "2 RICO")
-    lineFor("BulletGravity", hud.lineGrav, "3 GRAV")
-    lineFor("ShellSpeed",    hud.lineSpd,  "4 SPD")
-    lineFor("Damage",        hud.lineDmg,  "5 DMG")
-    lineFor("Reload",        hud.lineRld,  "6 RLD")
+    lineFor("Penetration",   hud.linePen,  "F5 PEN ")
+    lineFor("Ricochet",      hud.lineRic,  "F6 RICO")
+    lineFor("BulletGravity", hud.lineGrav, "F7 GRAV")
+    lineFor("ShellSpeed",    hud.lineSpd,  "F8 SPD ")
+    lineFor("Damage",        hud.lineDmg,  "F9 DMG ")
+    lineFor("Reload",        hud.lineRld,  "F10 RLD")
     hud.lineStat.Text = string.format("PATCHED: %d values  · roots: %d",
         state.lastScanCount, #state.scanRoots)
     hud.lineStat.Color = Color3.fromRGB(180, 220, 255)
@@ -298,11 +298,17 @@ end
 -- ────────────────────────────────────────────────────────────────────
 -- Hotkeys
 -- ────────────────────────────────────────────────────────────────────
+-- Function keys aren't grabbed by Roblox chat / hotbar.
 local KEYS = {
-    [0x31] = "Penetration",   [0x32] = "Ricochet",
-    [0x33] = "BulletGravity", [0x34] = "ShellSpeed",
-    [0x35] = "Damage",        [0x36] = "Reload",
+    [0x74] = "Penetration",    -- F5
+    [0x75] = "Ricochet",       -- F6
+    [0x76] = "BulletGravity",  -- F7
+    [0x77] = "ShellSpeed",     -- F8
+    [0x78] = "Damage",         -- F9
+    [0x79] = "Reload",         -- F10
 }
+local KEY_REFRESH = 0x73   -- F4
+local KEY_CLOSE   = 0x71   -- F2
 
 spawn(function()
     local prev = {}
@@ -326,18 +332,18 @@ spawn(function()
             end
             prev[k] = d
         end
-        -- R = force refresh
-        local r = iskeypressed(0x52)
-        if r and not prev[0x52] then
+        -- F4 = force refresh
+        local r = iskeypressed(KEY_REFRESH)
+        if r and not prev[KEY_REFRESH] then
             buildScanRoots()
             applyPatches()
             safeNotify(string.format("Manual refresh · %d values", state.lastScanCount), "matcha", 2)
         end
-        prev[0x52] = r
-        -- X = close
-        local x = iskeypressed(0x58)
-        if x and not prev[0x58] then closeScript(); return end
-        prev[0x58] = x
+        prev[KEY_REFRESH] = r
+        -- F2 = close
+        local x = iskeypressed(KEY_CLOSE)
+        if x and not prev[KEY_CLOSE] then closeScript(); return end
+        prev[KEY_CLOSE] = x
         wait(0.05)
     end
 end)
@@ -365,5 +371,6 @@ end)
 -- Restore originals if LP leaves / character resets
 LP.CharacterRemoving:Connect(function() restoreAll() end)
 
-safeNotify("MTC4 patcher armed · 1/2/3/4 toggle · R force refresh · X close", "matcha", 5)
+safeNotify("MTC4 patcher armed · F5–F10 toggle · F4 refresh · F2 close", "matcha", 5)
 print("[MTC4P] armed. PATCH_TARGETS hot — scanning ReplicatedStorage.TankInfo + LP vehicle.")
+print("[MTC4P] hotkeys: F5=Pen F6=Rico F7=Grav F8=Spd F9=Dmg F10=Rld · F4=refresh F2=close")
