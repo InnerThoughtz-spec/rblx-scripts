@@ -141,7 +141,7 @@ hud.lineTarget = mkLine(52, "Target:    -")
 hud.lineMeter  = mkLine(70, "Meter:     -")
 hud.lineSrc    = mkLine(88, "Source:    -")
 hud.lineLast   = mkLine(108, "Last shot: -")
-hud.lineHint   = mkLine(140, "TAP E (don't hold) · T=toggle [ ]=tune R=record M=diag N=close")
+hud.lineHint   = mkLine(140, "TAP E (don't hold) · T=toggle [ ]=tune `=record M=diag N=close")
 setProp(hud.lineHint, "Color", Color3.fromRGB(140, 150, 160))
 setProp(hud.lineHint, "Size", 10)
 
@@ -289,7 +289,7 @@ spawn(function()
             if edge(CONFIG.tuneCoarseUp)   then CONFIG.target = math.min(1.50, CONFIG.target + 0.01) end
             if edge(CONFIG.tuneCoarseDown) then CONFIG.target = math.max(0.10, CONFIG.target - 0.01) end
             if edge(CONFIG.diagKey)        then spawn(function() pcall(diagDump) end) end
-            if edge(0x52)                  then spawn(function() pcall(recordMode) end) end  -- R = record
+            if edge(0xC0)                  then spawn(function() pcall(recordMode) end) end  -- ` (backtick) = record
             if edge(CONFIG.closeKey) then
                 state.closed = true
                 for _, d in ipairs(allDrawings) do
