@@ -1,327 +1,169 @@
 -- RB5 World 5 Auto Green // Matcha external
--- Adaptive timing per FPS + per ping bucket · tunable in real time
+-- METER-BASED — polls the character's ShotMeter attribute and releases at
+-- the configured target. This is the correct RB-series mechanic
+-- (reverse-engineered from RBW4 reference: timer=0.85 means meter>=0.85).
+--
+-- 0.85   = basket (LO confirmed this hits but not perfect)
+-- 0.93+  = perfect green (community-typical for RB5 W5)
+-- 1.00   = top of bar (anything over 1.2 = overcharge / brick)
+--
 -- Load: loadstring(game:HttpGet("https://raw.githubusercontent.com/InnerThoughtz-spec/rblx-scripts/refs/heads/main/rb5w5-autogreen.lua"))()
 
--- ─── Config ─────────────────────────────────────────────────────────
--- RB5 World 5 release-window seed values (seconds from press → release).
--- Each FPS preset has 4 per-ping buckets (LOW≤30, MID≤60, HIGH≤100, SPIKE>100).
--- Tune with [ and ] keys (-/+ 1ms per tap). Cycle FPS preset with \.
 local CONFIG = {
-    fpsPresets = {
-        { name = "30 FPS",  buckets = { 0.322, 0.324, 0.328, 0.332 } },
-        { name = "60 FPS",  buckets = { 0.337, 0.339, 0.342, 0.346 } },
-        { name = "240 FPS", buckets = { 0.349, 0.350, 0.352, 0.356 } },
-        { name = "Custom",  buckets = { 0.345, 0.345, 0.345, 0.345 } },
-    },
-    customPresetIdx = 4,
-    defaultFpsIdx   = 2,    -- start on 60 FPS bucket
-    defaultCustomMs = 345,
+    target            = 0.96,   -- ShotMeter value to release at (the perfect-green zone)
+    overchargeCeiling = 1.20,   -- anything past this = brick
 
-    pingBuckets = {
-        { maxPing = 30,   label = "LOW"   },
-        { maxPing = 60,   label = "MID"   },
-        { maxPing = 100,  label = "HIGH"  },
-        { maxPing = 9999, label = "SPIKE" },
-    },
+    shootKey          = 0x46,   -- F (the RBW4 reference uses F; change to 0x45 for E)
+    toggleKey         = 0x54,   -- T
+    tuneUpKey         = 0xDD,   -- ]  → target +0.001
+    tuneDownKey       = 0xDB,   -- [  → target -0.001
+    tuneCoarseUp      = 0xBB,   -- =  → target +0.01
+    tuneCoarseDown    = 0xBD,   -- -  → target -0.01
+    closeKey          = 0x71,   -- F2
+    diagKey           = 0x70,   -- F1 (dump found events / attributes)
 
-    pingWindowSize   = 5,
-    pingIntervalFast = 0.10,
-    pingIntervalSlow = 1.00,
-    hudRepaintRate   = 0.05,
-    pingURL          = "https://www.gstatic.com/generate_204",
-
-    shootKey       = 0x45, manualKey = 0x56, toggleKey = 0x54,  -- E / V / T
-    cyclePingKey   = 0x50, cycleFpsKey = 0xDC,                  -- P / \
-    tuneUpKey      = 0xDD, tuneDownKey = 0xDB,                  -- ] / [
-    minimizeKey    = 0x70, restoreKey  = 0x71,                  -- F1 / F2
-    tuneStep       = 0.001, autoOnShoot = true,
-
-    hudW = 360, hudHCollapsed = 188, hudHExpanded = 236,
+    hudX = 20, hudY = 260, hudW = 340, hudH = 168,
 }
 
 local state = {
-    enabled = true, busy = false, currentPing = 0,
-    currentBucket = CONFIG.pingBuckets[1],
-    durationOffset = 0, pingSource = "init",
-    manualBucketIdx = nil,
-    fpsIdx = CONFIG.defaultFpsIdx,
-    customMs = CONFIG.defaultCustomMs,
-    sliderDragging = false,
-    hudX = 20, hudY = 20,
-    closed = false, minimized = false,
-    sliderVisible = false,
-    hudDragging = false, hudDragOffX = 0, hudDragOffY = 0,
+    enabled       = true,
+    closed        = false,
+    lastShotMeter = 0,
+    lastFireOk    = false,
+    lastResult    = "—",
+    shootEvent    = nil,    -- discovered RemoteEvent for "Shoot"
+    shootEventPath= "—",
+    meterAttrName = "ShotMeter",
+    busy          = false,
 }
-local pingHistory = {}
 
--- ─── Helpers ────────────────────────────────────────────────────────
-local function now()
-    if tick then return tick() end
-    if os and os.clock then return os.clock() end
-    return os.time()
-end
-local function setCorner(d, r) pcall(function() d.Corner = r end) end
+-- ─── Services ───────────────────────────────────────────────────────
+local Players          = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService        = game:GetService("RunService")
+local LP                = Players.LocalPlayer
 
-local Players = game:GetService("Players")
-local LP = Players.LocalPlayer
-local mouse = LP:GetMouse()
-
-local function getMousePos() return mouse.X, mouse.Y end
-
-local function externalHttpGet(url)
-    if httpget then return pcall(function() return httpget(url) end) end
-    return false
-end
-local function safeNotify(msg, title, dur)
-    if notify then pcall(function() notify(msg, title, dur) end) end
+local function safeNotify(m, t, d)
+    if notify then pcall(function() notify(m, t, d) end) end
 end
 
--- ─── Drawing registry ───────────────────────────────────────────────
+-- ─── Find the Shoot remote event ────────────────────────────────────
+-- RBW4 used ReplicatedStorage.GameEvents.ClientAction (RemoteEvent, args: "Shoot", bool)
+-- RB5 may have moved/renamed it. Probe known paths first, then fall back to a scan.
+local function findShootEvent()
+    local candidates = {
+        { path = "GameEvents.ClientAction", remote = "ClientAction", actionArg = "Shoot" },
+        { path = "Events.ClientAction",     remote = "ClientAction", actionArg = "Shoot" },
+        { path = "Remotes.ClientAction",    remote = "ClientAction", actionArg = "Shoot" },
+        { path = "GameEvents.Shoot",        remote = "Shoot",         actionArg = nil    },
+        { path = "Events.Shoot",            remote = "Shoot",         actionArg = nil    },
+        { path = "Remotes.Shoot",           remote = "Shoot",         actionArg = nil    },
+        { path = "Shoot",                   remote = "Shoot",         actionArg = nil    },
+    }
+    for _, c in ipairs(candidates) do
+        local node = ReplicatedStorage
+        for part in c.path:gmatch("[^%.]+") do
+            if node then node = node:FindFirstChild(part) end
+        end
+        if node and node:IsA("RemoteEvent") then
+            state.shootEvent     = node
+            state.shootEventPath = "RS." .. c.path
+            state.shootActionArg = c.actionArg
+            return
+        end
+    end
+
+    -- Generic scan: any RemoteEvent named ClientAction / Shoot / BallAction
+    local scanNames = { ClientAction = "Shoot", Shoot = nil, BallAction = "Shoot", ShootAction = nil }
+    for _, d in ipairs(ReplicatedStorage:GetDescendants()) do
+        if d:IsA("RemoteEvent") and scanNames[d.Name] ~= nil then
+            state.shootEvent     = d
+            state.shootEventPath = d:GetFullName()
+            state.shootActionArg = scanNames[d.Name]
+            return
+        end
+    end
+end
+
+-- ─── Find the ShotMeter attribute ───────────────────────────────────
+-- RBW4 char attribute "ShotMeter". RB5 might rename.
+local function probeMeterAttr()
+    local char = LP.Character
+    if not char then return end
+    local candidates = { "ShotMeter", "ShotBar", "Meter", "Charge", "ChargeBar", "ShootMeter", "ShotProgress" }
+    for _, name in ipairs(candidates) do
+        if char:GetAttribute(name) ~= nil then
+            state.meterAttrName = name
+            return
+        end
+    end
+end
+
+-- ─── HUD ────────────────────────────────────────────────────────────
 local allDrawings = {}
-local drawingRel  = {}
-local sliderSet   = {}
-
-local function regDrawing(kind)
-    local d = Drawing.new(kind)
+local function newDraw(k)
+    local d = Drawing.new(k)
     table.insert(allDrawings, d)
     return d
 end
-local function place(d, dx, dy)
-    drawingRel[d] = { dx = dx, dy = dy }
-    d.Position = Vector2.new(state.hudX + dx, state.hudY + dy)
+
+local hud = {}
+hud.bg = newDraw("Square")
+hud.bg.Color = Color3.fromRGB(12, 14, 18); hud.bg.Filled = true
+hud.bg.Transparency = 0.92; hud.bg.ZIndex = 998; hud.bg.Visible = true
+hud.bg.Size = Vector2.new(CONFIG.hudW, CONFIG.hudH)
+hud.bg.Position = Vector2.new(CONFIG.hudX, CONFIG.hudY)
+pcall(function() hud.bg.Corner = 10 end)
+
+hud.accent = newDraw("Square")
+hud.accent.Color = Color3.fromRGB(110, 230, 130); hud.accent.Filled = true
+hud.accent.Transparency = 1; hud.accent.ZIndex = 999; hud.accent.Visible = true
+hud.accent.Size = Vector2.new(4, CONFIG.hudH)
+hud.accent.Position = Vector2.new(CONFIG.hudX, CONFIG.hudY)
+
+hud.title = newDraw("Text")
+hud.title.Text = "RB5 W5 Auto Green · matcha"
+hud.title.Size = 15; hud.title.Font = Drawing.Fonts.SystemBold
+hud.title.Color = Color3.fromRGB(240, 240, 245); hud.title.Outline = true
+hud.title.ZIndex = 1000; hud.title.Visible = true
+hud.title.Position = Vector2.new(CONFIG.hudX + 14, CONFIG.hudY + 8)
+
+local function mkLine(dy)
+    local t = newDraw("Text")
+    t.Size = 12; t.Font = Drawing.Fonts.Monospace
+    t.Color = Color3.fromRGB(210, 215, 220); t.Outline = true
+    t.ZIndex = 1000; t.Visible = true
+    t.Position = Vector2.new(CONFIG.hudX + 14, CONFIG.hudY + dy)
+    return t
 end
-local function placeLine(d, fromDx, fromDy, toDx, toDy)
-    drawingRel[d] = { isLine = true, fromDx = fromDx, fromDy = fromDy, toDx = toDx, toDy = toDy }
-    d.From = Vector2.new(state.hudX + fromDx, state.hudY + fromDy)
-    d.To   = Vector2.new(state.hudX + toDx,   state.hudY + toDy)
-end
-local function applyAllPositions()
-    for d, r in pairs(drawingRel) do
-        if r.isLine then
-            d.From = Vector2.new(state.hudX + r.fromDx, state.hudY + r.fromDy)
-            d.To   = Vector2.new(state.hudX + r.toDx,   state.hudY + r.toDy)
-        else
-            d.Position = Vector2.new(state.hudX + r.dx, state.hudY + r.dy)
-        end
-    end
-end
+hud.lineStatus = mkLine(34)
+hud.lineTarget = mkLine(52)
+hud.lineMeter  = mkLine(70)
+hud.lineEvent  = mkLine(88)
+hud.lineAttr   = mkLine(106)
+hud.lineLast   = mkLine(124)
+hud.lineHint   = mkLine(146)
+hud.lineHint.Color = Color3.fromRGB(140, 150, 160)
+hud.lineHint.Size = 10
+hud.lineHint.Text = "F=shoot T=toggle [ ]=±.001 -/+=±.01 F1=diag F2=close"
 
--- ─── Layout ─────────────────────────────────────────────────────────
-local PAD = 14
-local CLOSE_W, MIN_W, BTN_H_TITLE = 24, 24, 22
-local CLOSE_DX = CONFIG.hudW - PAD - CLOSE_W
-local MIN_DX   = CLOSE_DX - 6 - MIN_W
-local TITLE_BTN_DY = 8
-
-local BTN_H = 32
-local BTN_TEXT_SZ = 13
-local BTN_PAD = 6
-local BTN_DY = 96
-local BTN_AREA_W = CONFIG.hudW - PAD * 2
-local BTN_W = math.floor((BTN_AREA_W - BTN_PAD * 3) / 4)
-
-local SLIDER_DX = PAD
-local SLIDER_DY = 158
-local SLIDER_W  = CONFIG.hudW - PAD * 2
-local SLIDER_H  = 10
-local THUMB_W   = 14
-local THUMB_H   = 18
-
--- ─── Build UI ───────────────────────────────────────────────────────
-local bg = regDrawing("Square")
-bg.Color = Color3.fromRGB(18, 20, 26); bg.Filled = true
-bg.Transparency = 0.88; bg.ZIndex = 10; bg.Visible = true
-setCorner(bg, 14); place(bg, 0, 0)
-
-local accent = regDrawing("Square")
-accent.Color = Color3.fromRGB(110, 230, 130); accent.Filled = true
-accent.Transparency = 1; accent.ZIndex = 11; accent.Visible = true
-setCorner(accent, 4); place(accent, 0, 0)
-
-local title = regDrawing("Text")
-title.Color = Color3.fromRGB(235, 240, 245)
-title.Text = "RB5 W5 Auto Green · matcha"
-title.Size = 16; title.Font = Drawing.Fonts.SystemBold
-title.ZIndex = 12; title.Visible = true
-place(title, PAD, 10)
-
-local minBtnBg = regDrawing("Square")
-minBtnBg.Size = Vector2.new(MIN_W, BTN_H_TITLE)
-minBtnBg.Color = Color3.fromRGB(58, 62, 72); minBtnBg.Filled = true
-minBtnBg.Transparency = 0.9; minBtnBg.ZIndex = 12; minBtnBg.Visible = true
-setCorner(minBtnBg, 5); place(minBtnBg, MIN_DX, TITLE_BTN_DY)
-
-local MIN_CY = TITLE_BTN_DY + BTN_H_TITLE / 2
-local minLine = regDrawing("Line")
-minLine.Color = Color3.fromRGB(230, 230, 230)
-minLine.Thickness = 2; minLine.Transparency = 1
-minLine.ZIndex = 14; minLine.Visible = true
-placeLine(minLine, MIN_DX + 6, MIN_CY, MIN_DX + MIN_W - 6, MIN_CY)
-
-local closeBtnBg = regDrawing("Square")
-closeBtnBg.Size = Vector2.new(CLOSE_W, BTN_H_TITLE)
-closeBtnBg.Color = Color3.fromRGB(165, 60, 60); closeBtnBg.Filled = true
-closeBtnBg.Transparency = 0.92; closeBtnBg.ZIndex = 12; closeBtnBg.Visible = true
-setCorner(closeBtnBg, 5); place(closeBtnBg, CLOSE_DX, TITLE_BTN_DY)
-
-local closeA = regDrawing("Line")
-closeA.Color = Color3.fromRGB(255, 240, 240)
-closeA.Thickness = 2; closeA.Transparency = 1; closeA.ZIndex = 14; closeA.Visible = true
-placeLine(closeA, CLOSE_DX + 7, TITLE_BTN_DY + 6, CLOSE_DX + CLOSE_W - 7, TITLE_BTN_DY + BTN_H_TITLE - 6)
-local closeB = regDrawing("Line")
-closeB.Color = Color3.fromRGB(255, 240, 240)
-closeB.Thickness = 2; closeB.Transparency = 1; closeB.ZIndex = 14; closeB.Visible = true
-placeLine(closeB, CLOSE_DX + 7, TITLE_BTN_DY + BTN_H_TITLE - 6, CLOSE_DX + CLOSE_W - 7, TITLE_BTN_DY + 6)
-
-local statusTxt = regDrawing("Text")
-statusTxt.Size = 14; statusTxt.Font = Drawing.Fonts.System
-statusTxt.ZIndex = 12; statusTxt.Visible = true
-place(statusTxt, PAD, 34)
-
-local pingTxt = regDrawing("Text")
-pingTxt.Size = 13; pingTxt.Font = Drawing.Fonts.Monospace
-pingTxt.ZIndex = 12; pingTxt.Visible = true
-place(pingTxt, PAD, 54)
-
-local durTxt = regDrawing("Text")
-durTxt.Color = Color3.fromRGB(180, 210, 195)
-durTxt.Size = 13; durTxt.Font = Drawing.Fonts.Monospace
-durTxt.ZIndex = 12; durTxt.Visible = true
-place(durTxt, PAD, 72)
-
-local fpsButtons = {}
-for i, preset in ipairs(CONFIG.fpsPresets) do
-    local dx = PAD + (i - 1) * (BTN_W + BTN_PAD)
-    local box = regDrawing("Square")
-    box.Filled = true; box.Transparency = 0.95
-    box.ZIndex = 12; box.Visible = true
-    box.Size = Vector2.new(BTN_W, BTN_H)
-    setCorner(box, 8); place(box, dx, BTN_DY)
-
-    local lbl = regDrawing("Text")
-    lbl.Size = BTN_TEXT_SZ
-    lbl.Center = true; lbl.Outline = true
-    lbl.Font = Drawing.Fonts.SystemBold
-    lbl.ZIndex = 13; lbl.Visible = true
-    lbl.Text = preset.name
-    place(lbl, dx + BTN_W / 2, BTN_DY + 12)
-
-    fpsButtons[i] = { dx = dx, w = BTN_W, h = BTN_H, box = box, lbl = lbl }
-end
-
-local sliderLbl = regDrawing("Text")
-sliderLbl.Size = 12; sliderLbl.Font = Drawing.Fonts.Monospace
-sliderLbl.ZIndex = 12; sliderLbl.Visible = false
-place(sliderLbl, PAD, 138); sliderSet[sliderLbl] = true
-
-local sliderTrack = regDrawing("Square")
-sliderTrack.Size = Vector2.new(SLIDER_W, SLIDER_H)
-sliderTrack.Color = Color3.fromRGB(36, 40, 48)
-sliderTrack.Filled = true; sliderTrack.Transparency = 1
-sliderTrack.ZIndex = 12; sliderTrack.Visible = false
-setCorner(sliderTrack, 5)
-place(sliderTrack, SLIDER_DX, SLIDER_DY + (THUMB_H - SLIDER_H) / 2)
-sliderSet[sliderTrack] = true
-
-local sliderFill = regDrawing("Square")
-sliderFill.Size = Vector2.new(0, SLIDER_H)
-sliderFill.Color = Color3.fromRGB(70, 165, 95)
-sliderFill.Filled = true; sliderFill.Transparency = 1
-sliderFill.ZIndex = 13; sliderFill.Visible = false
-setCorner(sliderFill, 5)
-place(sliderFill, SLIDER_DX, SLIDER_DY + (THUMB_H - SLIDER_H) / 2)
-sliderSet[sliderFill] = true
-
-local sliderThumb = regDrawing("Square")
-sliderThumb.Size = Vector2.new(THUMB_W, THUMB_H)
-sliderThumb.Color = Color3.fromRGB(230, 235, 240)
-sliderThumb.Filled = true; sliderThumb.Transparency = 1
-sliderThumb.ZIndex = 14; sliderThumb.Visible = false
-setCorner(sliderThumb, 5)
-place(sliderThumb, SLIDER_DX, SLIDER_DY)
-sliderSet[sliderThumb] = true
-
-local hintTxt = regDrawing("Text")
-hintTxt.Color = Color3.fromRGB(130, 140, 150)
-hintTxt.Size = 11; hintTxt.Font = Drawing.Fonts.System
-hintTxt.ZIndex = 12; hintTxt.Visible = true
-hintTxt.Text = "E=auto V=shot T=toggle P=ping \\=FPS [ ]=tune"
-place(hintTxt, PAD, 144)
-
-local hintTxt2 = regDrawing("Text")
-hintTxt2.Color = Color3.fromRGB(130, 140, 150)
-hintTxt2.Size = 11; hintTxt2.Font = Drawing.Fonts.System
-hintTxt2.ZIndex = 12; hintTxt2.Visible = true
-hintTxt2.Text = "F1=minimize F2=restore X=close · drag title to move"
-place(hintTxt2, PAD, 162)
-
-local minBadgeBg = regDrawing("Square")
-minBadgeBg.Color = Color3.fromRGB(70, 165, 95)
-minBadgeBg.Filled = true; minBadgeBg.Transparency = 0.95
-minBadgeBg.Size = Vector2.new(82, 24)
-minBadgeBg.ZIndex = 15; minBadgeBg.Visible = false
-setCorner(minBadgeBg, 6); place(minBadgeBg, 0, 0)
-
-local minBadgeLbl = regDrawing("Text")
-minBadgeLbl.Text = "RB5 ● F2"; minBadgeLbl.Size = 12
-minBadgeLbl.Center = true; minBadgeLbl.Color = Color3.fromRGB(255, 255, 255)
-minBadgeLbl.Font = Drawing.Fonts.SystemBold
-minBadgeLbl.ZIndex = 16; minBadgeLbl.Visible = false
-place(minBadgeLbl, 41, 8)
-
--- ─── Visibility / layout ────────────────────────────────────────────
-local function refreshVisibility()
+local function paintHud()
     if state.closed then return end
-    if state.minimized then
-        for _, d in ipairs(allDrawings) do d.Visible = false end
-        minBadgeBg.Visible = true; minBadgeLbl.Visible = true
-        return
-    end
-    for _, d in ipairs(allDrawings) do d.Visible = true end
-    minBadgeBg.Visible = false; minBadgeLbl.Visible = false
-    if not state.sliderVisible then
-        for d in pairs(sliderSet) do d.Visible = false end
-    end
+    hud.lineStatus.Text = "Status:    " .. (state.enabled and "ARMED" or "OFF") ..
+        (state.busy and "  ·  RELEASING" or "")
+    hud.lineStatus.Color = state.enabled and Color3.fromRGB(110, 230, 130) or Color3.fromRGB(220, 110, 110)
+
+    hud.lineTarget.Text = string.format("Target:    %.3f  (basket≥0.85 · perfect≈0.93–0.99 · brick>1.20)",
+        CONFIG.target)
+    hud.lineTarget.Color = Color3.fromRGB(255, 200, 80)
+
+    hud.lineMeter.Text  = string.format("Meter now: %.3f", state.lastShotMeter)
+    hud.lineEvent.Text  = "Event:     " .. state.shootEventPath
+    hud.lineAttr.Text   = "Attr:      char." .. state.meterAttrName
+    hud.lineLast.Text   = "Last shot: " .. state.lastResult
+    hud.accent.Color    = state.enabled and Color3.fromRGB(110, 230, 130) or Color3.fromRGB(220, 110, 110)
 end
 
-local function rebuildLayout()
-    if state.closed then return end
-    local h = state.sliderVisible and CONFIG.hudHExpanded or CONFIG.hudHCollapsed
-    bg.Size = Vector2.new(CONFIG.hudW, h)
-    accent.Size = Vector2.new(4, h)
-    if state.sliderVisible then
-        place(hintTxt,  PAD, 200)
-        place(hintTxt2, PAD, 218)
-    else
-        place(hintTxt,  PAD, 144)
-        place(hintTxt2, PAD, 162)
-    end
-    refreshVisibility()
-end
-
-local function applyFpsPreset(idx)
-    state.fpsIdx = idx
-    local p = CONFIG.fpsPresets[idx]
-    for i = 1, 4 do CONFIG.pingBuckets[i].duration = p.buckets[i] end
-    state.sliderVisible = (idx == CONFIG.customPresetIdx)
-    rebuildLayout()
-end
-local function applyCustomMs()
-    local sec = state.customMs / 1000
-    for i = 1, 4 do
-        CONFIG.fpsPresets[CONFIG.customPresetIdx].buckets[i] = sec
-        if state.fpsIdx == CONFIG.customPresetIdx then
-            CONFIG.pingBuckets[i].duration = sec
-        end
-    end
-end
-applyFpsPreset(state.fpsIdx); applyCustomMs()
-
-local function moveHud(nx, ny)
-    state.hudX = nx; state.hudY = ny
-    applyAllPositions()
-end
-local function setMinimized(v) state.minimized = v; refreshVisibility() end
 local function closeScript()
     state.closed = true
     for _, d in ipairs(allDrawings) do
@@ -332,311 +174,146 @@ local function closeScript()
     print("[RB5] closed.")
 end
 
--- ─── Paint ──────────────────────────────────────────────────────────
-local function activeDuration()
-    return state.currentBucket.duration + state.durationOffset
-end
-local function paintSlider()
-    local pct = state.customMs / 1000
-    local thumbDx = SLIDER_DX + (SLIDER_W - THUMB_W) * pct
-    place(sliderThumb, thumbDx, SLIDER_DY)
-    local fillW = thumbDx + THUMB_W / 2 - SLIDER_DX
-    if fillW < 0 then fillW = 0 end
-    sliderFill.Size = Vector2.new(fillW, SLIDER_H)
-    sliderLbl.Text  = string.format("Custom slider: %d ms", state.customMs)
-    sliderLbl.Color = Color3.fromRGB(110, 230, 130)
-end
-local function paint()
-    if state.closed or state.minimized then return end
-
-    if state.busy then
-        statusTxt.Text  = "Status: RELEASING"
-        statusTxt.Color = Color3.fromRGB(255, 200, 80)
-        accent.Color    = Color3.fromRGB(255, 200, 80)
-    elseif state.enabled then
-        statusTxt.Text  = "Status: ARMED  ·  " .. state.currentBucket.label
-        statusTxt.Color = Color3.fromRGB(110, 230, 130)
-        accent.Color    = Color3.fromRGB(110, 230, 130)
+-- ─── Shoot mechanic ─────────────────────────────────────────────────
+-- 1. fire ClientAction("Shoot", true)
+-- 2. poll character:GetAttribute(state.meterAttrName) every RenderStep
+-- 3. when meter >= target, fire ClientAction("Shoot", false)
+-- 4. log the meter value at release as the result
+local function fireShoot(isStart)
+    if not state.shootEvent then return false end
+    local ok
+    if state.shootActionArg then
+        ok = pcall(function() state.shootEvent:FireServer(state.shootActionArg, isStart) end)
     else
-        statusTxt.Text  = "Status: OFF"
-        statusTxt.Color = Color3.fromRGB(255, 110, 110)
-        accent.Color    = Color3.fromRGB(255, 110, 110)
+        ok = pcall(function() state.shootEvent:FireServer(isStart) end)
     end
+    return ok
+end
 
-    local pc
-    if     state.currentPing <= 30  then pc = Color3.fromRGB(110, 230, 130)
-    elseif state.currentPing <= 60  then pc = Color3.fromRGB(220, 220, 120)
-    elseif state.currentPing <= 100 then pc = Color3.fromRGB(255, 170, 80)
-    else                                 pc = Color3.fromRGB(255, 110, 110) end
-    pingTxt.Color = pc
-    pingTxt.Text  = string.format("Ping: %d ms  (%s)",
-        math.floor(state.currentPing + 0.5), state.pingSource)
+local function autoGreenShot()
+    if state.busy or not state.enabled then return end
+    if not state.shootEvent then
+        safeNotify("Shoot event not found — press F1 for diag", "matcha", 3)
+        return
+    end
+    state.busy = true
 
-    local d = activeDuration()
-    durTxt.Text = string.format("Release: %.1f ms   offset: %+d ms",
-        d * 1000, math.floor(state.durationOffset * 1000 + 0.5))
+    local char = LP.Character
+    if not char then state.busy = false; return end
 
-    for i, btn in ipairs(fpsButtons) do
-        if i == state.fpsIdx then
-            btn.box.Color = Color3.fromRGB(70, 165, 95)
-            btn.lbl.Color = Color3.fromRGB(255, 255, 255)
-        else
-            btn.box.Color = Color3.fromRGB(40, 44, 52)
-            btn.lbl.Color = Color3.fromRGB(190, 200, 210)
+    fireShoot(true)
+    local startedAt = tick()
+    local releaseMeter = 0
+    while true do
+        local m = char:GetAttribute(state.meterAttrName) or 0
+        state.lastShotMeter = m
+        if m >= CONFIG.target and m <= CONFIG.overchargeCeiling then
+            fireShoot(false)
+            releaseMeter = m
+            break
         end
+        if tick() - startedAt > 3 then
+            -- safety: bail if meter never reaches target (e.g. shot got cancelled)
+            fireShoot(false)
+            releaseMeter = m
+            break
+        end
+        RunService.Heartbeat:Wait()
     end
 
-    if state.sliderVisible then paintSlider() end
-end
-
--- ─── Ping ladder ────────────────────────────────────────────────────
-local function tryRobloxPing()
-    if not GetPingValue then return nil end
-    local ok, p = pcall(GetPingValue)
-    if ok and type(p) == "number" and p > 0 and p < 10000 then return p end
-    return nil
-end
-local function tryHttpPing()
-    local t0 = now()
-    if not externalHttpGet(CONFIG.pingURL) then return nil end
-    local elapsed = (now() - t0) * 1000
-    if elapsed < 0 or elapsed > 10000 then return nil end
-    return elapsed
-end
-
-local rblxAvailable = tryRobloxPing() ~= nil
-state.pingSource = rblxAvailable and "rblx" or "http"
-
-local function freshPing()
-    if rblxAvailable then
-        local p = tryRobloxPing()
-        if p then return p end
-        rblxAvailable = false
-        state.pingSource = "http"
+    -- classify
+    if releaseMeter >= 0.93 and releaseMeter <= 1.0 then
+        state.lastResult = string.format("%.3f  · GREEN", releaseMeter)
+    elseif releaseMeter >= 0.85 then
+        state.lastResult = string.format("%.3f  · basket", releaseMeter)
+    elseif releaseMeter > 1.0 then
+        state.lastResult = string.format("%.3f  · OVERCHARGE", releaseMeter)
+    else
+        state.lastResult = string.format("%.3f  · early/miss", releaseMeter)
     end
-    return tryHttpPing()
-end
-local function pushPing(p)
-    table.insert(pingHistory, 1, p)
-    while #pingHistory > CONFIG.pingWindowSize do table.remove(pingHistory) end
-end
-local function rollingMaxPing()
-    local m = 0
-    for _, p in ipairs(pingHistory) do if p > m then m = p end end
-    return m
-end
-local function bucketFor(ping)
-    for _, b in ipairs(CONFIG.pingBuckets) do
-        if ping <= b.maxPing then return b end
-    end
-    return CONFIG.pingBuckets[#CONFIG.pingBuckets]
-end
-local function refreshAtShotTime()
-    if state.manualBucketIdx then return end
-    if not rblxAvailable then return end
-    local p = tryRobloxPing()
-    if not p then return end
-    pushPing(p)
-    local eff = rollingMaxPing()
-    state.currentPing   = eff
-    state.currentBucket = bucketFor(eff)
+
+    wait(0.08)
+    state.busy = false
 end
 
--- ─── Shot routines ──────────────────────────────────────────────────
-local function perfectShot()
-    if state.busy or not state.enabled then return end
-    refreshAtShotTime()
-    state.busy = true; paint()
-    keypress(CONFIG.shootKey)
-    wait(activeDuration())
-    keyrelease(CONFIG.shootKey)
-    wait(0.08); state.busy = false; paint()
-end
-local function releaseOnly()
-    if state.busy or not state.enabled then return end
-    refreshAtShotTime()
-    state.busy = true; paint()
-    wait(activeDuration())
-    keyrelease(CONFIG.shootKey)
-    wait(0.08); state.busy = false; paint()
-end
-
--- ─── Mouse handler ──────────────────────────────────────────────────
-local function inRect(mx, my, dx, dy, w, h)
-    local x = state.hudX + dx
-    local y = state.hudY + dy
-    return mx >= x and mx <= x + w and my >= y and my <= y + h
-end
-local function setSliderFromMouseX(mx)
-    local pct = (mx - (state.hudX + SLIDER_DX)) / SLIDER_W
-    if pct < 0 then pct = 0 end
-    if pct > 1 then pct = 1 end
-    state.customMs = math.floor(pct * 1000 + 0.5)
-    applyCustomMs()
-end
-
-spawn(function()
-    local wasDown = false
-    while not state.closed do
-        local isDown = ismouse1pressed()
-        local mx, my = getMousePos()
-
-        if isDown and not wasDown and mx and my then
-            local handled = false
-            if state.minimized then
-                if inRect(mx, my, 0, 0, 82, 24) then
-                    setMinimized(false); handled = true
-                end
-            else
-                if not handled and inRect(mx, my, CLOSE_DX, TITLE_BTN_DY, CLOSE_W, BTN_H_TITLE) then
-                    closeScript(); return
-                end
-                if not handled and inRect(mx, my, MIN_DX, TITLE_BTN_DY, MIN_W, BTN_H_TITLE) then
-                    setMinimized(true); handled = true
-                end
-                if not handled and state.sliderVisible then
-                    if inRect(mx, my, SLIDER_DX, SLIDER_DY - 4, SLIDER_W, THUMB_H + 8) then
-                        state.sliderDragging = true
-                        setSliderFromMouseX(mx); paint()
-                        handled = true
-                    end
-                end
-                if not handled then
-                    for i, btn in ipairs(fpsButtons) do
-                        if inRect(mx, my, btn.dx, BTN_DY, btn.w, btn.h) then
-                            applyFpsPreset(i)
-                            if i == CONFIG.customPresetIdx then applyCustomMs() end
-                            paint()
-                            safeNotify("Preset: " .. CONFIG.fpsPresets[i].name, "matcha", 2)
-                            handled = true
-                            break
-                        end
-                    end
-                end
-                if not handled then
-                    if my >= state.hudY and my <= state.hudY + 30
-                    and mx >= state.hudX and mx <= state.hudX + CONFIG.hudW then
-                        state.hudDragging = true
-                        state.hudDragOffX = mx - state.hudX
-                        state.hudDragOffY = my - state.hudY
-                        handled = true
-                    end
-                end
+-- ─── Diagnostic dump ────────────────────────────────────────────────
+local function diagDump()
+    print("=== RB5 Auto Green diagnostic ===")
+    print("Shoot event candidate:  " .. state.shootEventPath)
+    print("Meter attribute name:   " .. state.meterAttrName)
+    local char = LP.Character
+    if char then
+        print("--- Character attributes (numeric) ---")
+        for k, v in pairs(char:GetAttributes()) do
+            if type(v) == "number" then
+                print(string.format("  @%s = %s", tostring(k), tostring(v)))
             end
         end
-
-        if isDown and state.sliderDragging and mx then
-            setSliderFromMouseX(mx); paint()
-        elseif isDown and state.hudDragging and mx and my then
-            moveHud(mx - state.hudDragOffX, my - state.hudDragOffY)
-        end
-        if not isDown then
-            state.sliderDragging = false
-            state.hudDragging = false
-        end
-        wasDown = isDown
-        wait(0.012)
     end
-end)
-
--- ─── Hotkey loop ────────────────────────────────────────────────────
-local function cycleFps()
-    state.fpsIdx = (state.fpsIdx % #CONFIG.fpsPresets) + 1
-    applyFpsPreset(state.fpsIdx)
-    if state.fpsIdx == CONFIG.customPresetIdx then applyCustomMs() end
-    paint()
-    safeNotify("Preset: " .. CONFIG.fpsPresets[state.fpsIdx].name, "matcha", 2)
+    print("--- ReplicatedStorage top-level RemoteEvents ---")
+    for _, d in ipairs(ReplicatedStorage:GetDescendants()) do
+        if d:IsA("RemoteEvent") then
+            local n = string.lower(d.Name)
+            if n:find("shoot") or n:find("action") or n:find("ball") or n:find("event") then
+                print("  " .. d:GetFullName())
+            end
+        end
+    end
+    print("=== end ===")
+    safeNotify("Diagnostic dumped to console", "matcha", 3)
 end
 
+-- ─── Hotkeys ────────────────────────────────────────────────────────
 spawn(function()
     local prev = {}
-    local function edge(k, name)
-        if k == 0 then return false end
-        local d = iskeypressed(k)
-        local was = prev[name]; prev[name] = d
-        return d and not was
-    end
-
     while not state.closed do
-        if CONFIG.manualKey ~= 0 and edge(CONFIG.manualKey, "manual") then
-            spawn(perfectShot)
+        local function edge(k)
+            local d = iskeypressed(k)
+            local was = prev[k]; prev[k] = d
+            return d and not was
         end
-        if edge(CONFIG.toggleKey, "toggle") then
-            state.enabled = not state.enabled; paint()
-        end
-        if edge(CONFIG.tuneUpKey, "up") then
-            state.durationOffset = state.durationOffset + CONFIG.tuneStep; paint()
-        end
-        if edge(CONFIG.tuneDownKey, "down") then
-            state.durationOffset = state.durationOffset - CONFIG.tuneStep; paint()
-        end
-        if edge(CONFIG.cyclePingKey, "cycle") then
-            if state.manualBucketIdx == nil then
-                state.manualBucketIdx = 1
-            else
-                state.manualBucketIdx = state.manualBucketIdx + 1
-                if state.manualBucketIdx > #CONFIG.pingBuckets then
-                    state.manualBucketIdx = nil
-                end
-            end
-            if state.manualBucketIdx then
-                state.currentBucket = CONFIG.pingBuckets[state.manualBucketIdx]
-                state.pingSource    = "manual"
-                state.currentPing   = state.currentBucket.maxPing
-            else
-                state.pingSource = rblxAvailable and "rblx" or "http"
-            end
-            paint()
-        end
-        if edge(CONFIG.cycleFpsKey, "fps") then cycleFps() end
-        if edge(CONFIG.minimizeKey, "min") then setMinimized(true) end
-        if edge(CONFIG.restoreKey,  "rest") then setMinimized(false) end
+
+        if edge(CONFIG.shootKey) then spawn(autoGreenShot) end
+        if edge(CONFIG.toggleKey) then state.enabled = not state.enabled end
+        if edge(CONFIG.tuneUpKey)    then CONFIG.target = math.min(1.20, CONFIG.target + 0.001) end
+        if edge(CONFIG.tuneDownKey)  then CONFIG.target = math.max(0.50, CONFIG.target - 0.001) end
+        if edge(CONFIG.tuneCoarseUp) then CONFIG.target = math.min(1.20, CONFIG.target + 0.01) end
+        if edge(CONFIG.tuneCoarseDown) then CONFIG.target = math.max(0.50, CONFIG.target - 0.01) end
+        if edge(CONFIG.diagKey)   then diagDump() end
+        if edge(CONFIG.closeKey)  then closeScript(); return end
+
         wait(0.008)
     end
 end)
 
--- ─── Auto-release on E press ────────────────────────────────────────
-if CONFIG.autoOnShoot then
-    spawn(function()
-        local wasDown = false
-        while not state.closed do
-            if state.enabled and not state.busy then
-                local down = iskeypressed(CONFIG.shootKey)
-                if down and not wasDown then spawn(releaseOnly) end
-                wasDown = down
-            else
-                wasDown = iskeypressed(CONFIG.shootKey)
-            end
-            wait(0.002)
+-- ─── Background meter readout (for live HUD) ────────────────────────
+spawn(function()
+    while not state.closed do
+        local char = LP.Character
+        if char and not state.busy then
+            local m = char:GetAttribute(state.meterAttrName)
+            if type(m) == "number" then state.lastShotMeter = m end
         end
-    end)
+        paintHud()
+        wait(0.05)
+    end
+end)
+
+-- ─── Init: rediscover event + attr on each respawn ──────────────────
+findShootEvent()
+probeMeterAttr()
+
+LP.CharacterAdded:Connect(function()
+    wait(0.5)
+    probeMeterAttr()
+end)
+
+if not state.shootEvent then
+    safeNotify("Shoot event not auto-found — press F1 for diagnostic", "matcha", 5)
+    print("[RB5] WARN: no shoot RemoteEvent found. Press F1 to dump candidates.")
+else
+    safeNotify(string.format("RB5 W5 armed · target=%.3f · event=%s", CONFIG.target, state.shootEventPath), "matcha", 4)
 end
-
--- ─── Background ping watcher ────────────────────────────────────────
-spawn(function()
-    while not state.closed do
-        if state.manualBucketIdx == nil then
-            local p = freshPing()
-            if p then
-                pushPing(p)
-                local eff = rollingMaxPing()
-                state.currentPing  = eff
-                state.currentBucket = bucketFor(eff)
-            end
-        end
-        wait(rblxAvailable and CONFIG.pingIntervalFast or CONFIG.pingIntervalSlow)
-    end
-end)
-
--- ─── Live repaint ──────────────────────────────────────────────────
-spawn(function()
-    while not state.closed do
-        paint(); wait(CONFIG.hudRepaintRate)
-    end
-end)
-
-rebuildLayout(); paint()
-safeNotify(string.format("RB5 W5 Auto Green ready · FPS=%s · ping=%s",
-    CONFIG.fpsPresets[state.fpsIdx].name, state.pingSource), "matcha", 4)
-print("[RB5] armed. mouse=LP:GetMouse() · ping=" .. state.pingSource)
-print("[RB5] tune with [ and ] · cycle FPS preset with \\ · T to toggle")
+print(string.format("[RB5] armed. target=%.3f  event=%s  attr=%s",
+    CONFIG.target, state.shootEventPath, state.meterAttrName))
+print("[RB5] F=shoot · T=toggle · [ ]=±.001 · - +=±.01 · F1=diag · F2=close")
