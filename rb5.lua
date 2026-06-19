@@ -85,7 +85,12 @@ end
 local function probeMeterAttr()
     local char = LP.Character
     if not char then return end
-    local candidates = { "ShotMeter", "ShotBar", "Meter", "Charge", "ChargeBar", "ShootMeter", "ShotProgress", "ReleaseTime" }
+    local candidates = {
+        "ShotMeter", "ShotBar", "Meter", "Charge", "ChargeBar", "ShootMeter",
+        "ShotProgress", "ReleaseTime", "Release", "Power", "ShotPower",
+        "ChargeLevel", "ChargePercent", "ShotCharge", "ChargeAmount",
+        "ShotPercent", "MeterValue", "Progress", "FillAmount",
+    }
     for _, name in ipairs(candidates) do
         if char:GetAttribute(name) ~= nil then
             state.meterAttrName = name
@@ -141,7 +146,7 @@ hud.lineMode   = mkLine(142)
 hud.lineHint   = mkLine(162)
 hud.lineHint.Color = Color3.fromRGB(140, 150, 160)
 hud.lineHint.Size = 10
-hud.lineHint.Text = "E=shoot T=toggle [ ]=±.001 -/+=±.01 F1=diag F2=close"
+hud.lineHint.Text = "E=shoot T=toggle [ ]=±.001 F1=diag F3=autodetect F2=close"
 
 local function paintHud()
     if state.closed then return end
@@ -294,6 +299,62 @@ local function diagDump()
     safeNotify("Diagnostic dumped to console", "matcha", 3)
 end
 
+-- ─── F3: Auto-detect meter attribute ────────────────────────────────
+-- Holds E, snapshots every numeric character attribute, watches which
+-- one climbs the fastest, then locks that as the meter attr.
+local function autoDetectMeter()
+    local char = LP.Character
+    if not char then
+        safeNotify("AutoDetect: no character — spawn first", "matcha", 3)
+        return
+    end
+    safeNotify("AutoDetect: tapping E for 1.5s — watch console", "matcha", 4)
+    print("[RB5] === AUTODETECT METER ===")
+
+    -- snapshot
+    local before = {}
+    for k, v in pairs(char:GetAttributes()) do
+        if type(v) == "number" then before[k] = v end
+    end
+    print("[RB5] snapshot: " .. tostring(next(before) and "ok" or "EMPTY (need to hold ball first)"))
+
+    -- press E and watch
+    pcall(function() keypress(CONFIG.shootKey) end)
+    local started = tick()
+    local peak = {}
+    while tick() - started < 1.5 do
+        for k, sv in pairs(before) do
+            local cur = char:GetAttribute(k)
+            if type(cur) == "number" then
+                local delta = cur - sv
+                if delta > (peak[k] or -math.huge) then peak[k] = delta end
+            end
+        end
+        RunService.Heartbeat:Wait()
+    end
+    -- release E (hammer)
+    for _ = 1, 3 do
+        pcall(function() keyrelease(CONFIG.shootKey) end)
+    end
+
+    -- rank by largest positive delta
+    local best, bestDelta = nil, 0
+    print("[RB5] attribute deltas during shot:")
+    for k, d in pairs(peak) do
+        print(string.format("        @%s   delta=%+.4f   from=%s", k, d, tostring(before[k])))
+        if d > bestDelta then bestDelta = d; best = k end
+    end
+    if best then
+        state.meterAttrName = best
+        print(string.format("[RB5] METER ATTR LOCKED IN: %s  (rose by %.3f)", best, bestDelta))
+        safeNotify("Meter locked: " .. best, "matcha", 4)
+    else
+        print("[RB5] no attribute climbed — keypress may not be reaching game OR meter is elsewhere")
+        safeNotify("AutoDetect failed — paste console output", "matcha", 5)
+    end
+    print("[RB5] === end autodetect ===")
+end
+
 -- ─── Hotkeys ────────────────────────────────────────────────────────
 spawn(function()
     local prev = {}
@@ -314,6 +375,7 @@ spawn(function()
         if edge(CONFIG.tuneCoarseUp)   then CONFIG.target = math.min(1.20, CONFIG.target + 0.01) end
         if edge(CONFIG.tuneCoarseDown) then CONFIG.target = math.max(0.50, CONFIG.target - 0.01) end
         if edge(CONFIG.diagKey)        then diagDump() end
+        if edge(0x72)                  then spawn(autoDetectMeter) end  -- F3 = autodetect
         if edge(CONFIG.closeKey)       then closeScript(); return end
 
         wait(0.008)
