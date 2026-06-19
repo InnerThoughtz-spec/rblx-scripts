@@ -7,7 +7,7 @@
 local OK, ERR = pcall(function()
 
 local CONFIG = {
-    target            = 0.85,    -- shot-delta to release at (basket=0.85, green≈0.93)
+    target            = 0.920,   -- calibrated: 0.909 = basket/green boundary, 0.92+ should hit green
     overchargeCeiling = 1.50,
     shootKey          = 0x45,    -- E
     -- Letter-key hotkeys only (no F-keys per your request)
@@ -210,11 +210,12 @@ local function autoGreenShot()
         wait(0)
     end
 
-    if releaseAt >= 0.93 and releaseAt <= 1.10 then
+    -- Classification calibrated against LO's 0.909 = basket/green boundary
+    if releaseAt >= 0.91 and releaseAt <= 1.05 then
         state.lastResult = string.format("%.3f · GREEN", releaseAt)
     elseif releaseAt >= 0.85 then
         state.lastResult = string.format("%.3f · basket", releaseAt)
-    elseif releaseAt > 1.10 then
+    elseif releaseAt > 1.05 then
         state.lastResult = string.format("%.3f · OVERCHARGE", releaseAt)
     elseif releaseAt == 0 then
         state.lastResult = "0.000 · no meter (hold ball + try)"
