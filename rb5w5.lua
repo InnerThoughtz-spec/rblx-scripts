@@ -15,7 +15,7 @@ local CONFIG = {
     target            = 0.96,   -- ShotMeter value to release at
     overchargeCeiling = 1.20,
 
-    shootKey          = 0x46,   -- F  (match the in-game shoot bind)
+    shootKey          = 0x45,   -- E  (RB5 W5 shoot bind)
     toggleKey         = 0x54,   -- T
     tuneUpKey         = 0xDD,   -- ]  → target +0.001
     tuneDownKey       = 0xDB,   -- [  → target -0.001
@@ -141,7 +141,7 @@ hud.lineMode   = mkLine(142)
 hud.lineHint   = mkLine(162)
 hud.lineHint.Color = Color3.fromRGB(140, 150, 160)
 hud.lineHint.Size = 10
-hud.lineHint.Text = "F=shoot T=toggle [ ]=±.001 -/+=±.01 F1=diag F2=close"
+hud.lineHint.Text = "E=shoot T=toggle [ ]=±.001 -/+=±.01 F1=diag F2=close"
 
 local function paintHud()
     if state.closed then return end
@@ -333,4 +333,4 @@ end)
 safeNotify(string.format("RB5 W5 armed · target=%.3f", CONFIG.target), "matcha", 4)
 print(string.format("[RB5] armed. target=%.3f  event=%s  attr=%s",
     CONFIG.target, state.shootEventPath, state.meterAttrName))
-print("[RB5] F=shoot · T=toggle · [ ]=±.001 · - +=±.01 · F1=diag · F2=close")
+print("[RB5] E=shoot · T=toggle · [ ]=±.001 · - +=±.01 · F1=diag · F2=close")
