@@ -1,0 +1,291 @@
+-- RB5 World 5 Auto Green // Matcha external · bulletproof rewrite
+-- Meter source: workspace[YourName].Properties.ShotMeter (NumberValue)
+-- Mechanic: tap E once, script taps E for you, polls meter delta,
+-- releases when delta >= target.
+-- Load: loadstring(game:HttpGet("https://raw.githubusercontent.com/InnerThoughtz-spec/rblx-scripts/main/rb4.lua?v=1"))()
+
+local OK, ERR = pcall(function()
+
+local CONFIG = {
+    target            = 0.85,    -- shot-delta to release at (basket=0.85, green≈0.93)
+    overchargeCeiling = 1.50,
+    shootKey          = 0x45,    -- E
+    -- Letter-key hotkeys only (no F-keys per your request)
+    toggleKey         = 0x54,    -- T = on/off
+    tuneUpKey         = 0xDD,    -- ] = +0.001
+    tuneDownKey       = 0xDB,    -- [ = -0.001
+    tuneCoarseUp      = 0xBB,    -- = = +0.01
+    tuneCoarseDown    = 0xBD,    -- - = -0.01
+    diagKey           = 0x4D,    -- M = diag dump
+    closeKey          = 0x4E,    -- N = close
+}
+
+local state = {
+    enabled       = true,
+    closed        = false,
+    busy          = false,
+    lastShotMeter = 0,
+    lastResult    = "—",
+    rawNow        = 0,
+}
+
+local function safeNotify(m, t, d)
+    pcall(function() if notify then notify(m, t, d) end end)
+end
+
+-- Get the Workspace service the safe way (matcha may not expose `workspace` global)
+local function getWorkspace()
+    local w
+    pcall(function() w = game:GetService("Workspace") end)
+    if w then return w end
+    pcall(function() w = workspace end)
+    return w
+end
+
+local function getLP()
+    local p
+    pcall(function() p = game:GetService("Players").LocalPlayer end)
+    return p
+end
+
+-- Locate workspace[YourName].Properties.ShotMeter
+local function findShotMeter()
+    local lp = getLP()
+    if not lp then return nil end
+    local lpName
+    pcall(function() lpName = lp.Name end)
+    if not lpName then return nil end
+    local ws = getWorkspace()
+    if not ws then return nil end
+    local char
+    pcall(function() char = ws:FindFirstChild(lpName) end)
+    if not char then return nil end
+    local props
+    pcall(function() props = char:FindFirstChild("Properties") end)
+    if not props then return nil end
+    local sm
+    pcall(function() sm = props:FindFirstChild("ShotMeter") end)
+    return sm
+end
+
+local function readMeter()
+    local sm = findShotMeter()
+    if not sm then return 0 end
+    local v = 0
+    pcall(function() v = sm.Value end)
+    if type(v) ~= "number" then v = 0 end
+    return v
+end
+
+-- ─── Drawing helpers (every Drawing.new wrapped) ────────────────────
+local allDrawings = {}
+local function newDraw(kind)
+    local d
+    local ok = pcall(function() d = Drawing.new(kind) end)
+    if not ok or not d then return nil end
+    table.insert(allDrawings, d)
+    return d
+end
+
+local function setProp(d, key, val)
+    if not d then return end
+    pcall(function() d[key] = val end)
+end
+
+-- ─── HUD ────────────────────────────────────────────────────────────
+local HUD_X, HUD_Y, HUD_W, HUD_H = 20, 260, 360, 170
+local hud = {}
+
+hud.bg = newDraw("Square")
+setProp(hud.bg, "Color", Color3.fromRGB(12, 14, 18))
+setProp(hud.bg, "Filled", true)
+setProp(hud.bg, "Transparency", 0.92)
+setProp(hud.bg, "ZIndex", 998)
+setProp(hud.bg, "Visible", true)
+setProp(hud.bg, "Size", Vector2.new(HUD_W, HUD_H))
+setProp(hud.bg, "Position", Vector2.new(HUD_X, HUD_Y))
+
+hud.accent = newDraw("Square")
+setProp(hud.accent, "Color", Color3.fromRGB(110, 230, 130))
+setProp(hud.accent, "Filled", true)
+setProp(hud.accent, "Transparency", 1)
+setProp(hud.accent, "ZIndex", 999)
+setProp(hud.accent, "Visible", true)
+setProp(hud.accent, "Size", Vector2.new(4, HUD_H))
+setProp(hud.accent, "Position", Vector2.new(HUD_X, HUD_Y))
+
+hud.title = newDraw("Text")
+setProp(hud.title, "Text", "RB5 W5 Auto Green · matcha")
+setProp(hud.title, "Size", 15)
+setProp(hud.title, "Font", Drawing.Fonts.SystemBold)
+setProp(hud.title, "Color", Color3.fromRGB(240, 240, 245))
+setProp(hud.title, "Outline", true)
+setProp(hud.title, "ZIndex", 1000)
+setProp(hud.title, "Visible", true)
+setProp(hud.title, "Position", Vector2.new(HUD_X + 14, HUD_Y + 8))
+
+local function mkLine(dy, init)
+    local t = newDraw("Text")
+    setProp(t, "Size", 12)
+    setProp(t, "Font", Drawing.Fonts.Monospace)
+    setProp(t, "Color", Color3.fromRGB(210, 215, 220))
+    setProp(t, "Outline", true)
+    setProp(t, "ZIndex", 1000)
+    setProp(t, "Visible", true)
+    setProp(t, "Position", Vector2.new(HUD_X + 14, HUD_Y + dy))
+    setProp(t, "Text", init or "")
+    return t
+end
+hud.lineStatus = mkLine(34, "Status:    -")
+hud.lineTarget = mkLine(52, "Target:    -")
+hud.lineMeter  = mkLine(70, "Meter:     -")
+hud.lineSrc    = mkLine(88, "Source:    -")
+hud.lineLast   = mkLine(108, "Last shot: -")
+hud.lineHint   = mkLine(140, "E=shoot T=toggle [ ]=tune M=diag N=close")
+setProp(hud.lineHint, "Color", Color3.fromRGB(140, 150, 160))
+setProp(hud.lineHint, "Size", 10)
+
+local function paintHud()
+    pcall(function()
+        local statusTxt = state.enabled and "ARMED" or "OFF"
+        if state.busy then statusTxt = statusTxt .. "  ·  RELEASING" end
+        setProp(hud.lineStatus, "Text", "Status:    " .. statusTxt)
+        setProp(hud.lineStatus, "Color", state.enabled and Color3.fromRGB(110, 230, 130) or Color3.fromRGB(220, 110, 110))
+
+        setProp(hud.lineTarget, "Text", string.format("Target:    %.3f (basket=0.85 · GREEN=0.93+)", CONFIG.target))
+        setProp(hud.lineTarget, "Color", Color3.fromRGB(255, 200, 80))
+
+        setProp(hud.lineMeter, "Text", string.format("Meter:     raw=%.3f  shot-delta=%.3f", state.rawNow, state.lastShotMeter))
+
+        local sm = findShotMeter()
+        setProp(hud.lineSrc, "Text", "Source:    " .. (sm and "workspace[You].Properties.ShotMeter ✓" or "NOT FOUND — respawn?"))
+        setProp(hud.lineSrc, "Color", sm and Color3.fromRGB(110, 230, 130) or Color3.fromRGB(220, 110, 110))
+
+        setProp(hud.lineLast, "Text", "Last shot: " .. state.lastResult)
+
+        setProp(hud.accent, "Color", state.enabled and Color3.fromRGB(110, 230, 130) or Color3.fromRGB(220, 110, 110))
+    end)
+end
+
+-- ─── Shoot logic ────────────────────────────────────────────────────
+local function autoGreenShot()
+    if state.busy or not state.enabled then return end
+    state.busy = true
+
+    local baseline = readMeter()
+    pcall(function() keypress(CONFIG.shootKey) end)
+
+    local startedAt = tick()
+    local releaseDelta = 0
+
+    while not state.closed do
+        local raw = readMeter()
+        state.rawNow = raw
+        local delta = raw - baseline
+        if delta < 0 then delta = 0 end
+        state.lastShotMeter = delta
+
+        if delta >= CONFIG.target and delta <= CONFIG.overchargeCeiling then
+            for _ = 1, 4 do pcall(function() keyrelease(CONFIG.shootKey) end) end
+            releaseDelta = delta
+            break
+        end
+
+        if tick() - startedAt > 3 then
+            for _ = 1, 4 do pcall(function() keyrelease(CONFIG.shootKey) end) end
+            releaseDelta = delta
+            break
+        end
+
+        wait(0)
+    end
+
+    if releaseDelta >= 0.93 and releaseDelta <= 1.10 then
+        state.lastResult = string.format("%.3f · GREEN", releaseDelta)
+    elseif releaseDelta >= 0.85 then
+        state.lastResult = string.format("%.3f · basket", releaseDelta)
+    elseif releaseDelta > 1.10 then
+        state.lastResult = string.format("%.3f · OVERCHARGE", releaseDelta)
+    elseif releaseDelta == 0 then
+        state.lastResult = "0.000 · no meter (hold ball + try)"
+    else
+        state.lastResult = string.format("%.3f · early/miss", releaseDelta)
+    end
+
+    pcall(function() wait(0.08) end)
+    state.busy = false
+end
+
+-- ─── Diagnostic ─────────────────────────────────────────────────────
+local function diagDump()
+    print("=== RB5 W5 diag ===")
+    local sm = findShotMeter()
+    print("Meter found:  " .. tostring(sm and sm:GetFullName() or "nil"))
+    print("Meter value:  " .. tostring(readMeter()))
+    print("Target:       " .. tostring(CONFIG.target))
+    local lp = getLP()
+    print("LP name:      " .. tostring(lp and lp.Name or "nil"))
+    safeNotify("Diag dumped to console", "matcha", 3)
+end
+
+-- ─── Hotkeys ────────────────────────────────────────────────────────
+spawn(function()
+    pcall(function()
+        local prev = {}
+        local function edge(k)
+            local d
+            pcall(function() d = iskeypressed(k) end)
+            local was = prev[k]; prev[k] = d
+            return d and not was
+        end
+
+        while not state.closed do
+            if edge(CONFIG.shootKey) then
+                spawn(function() pcall(autoGreenShot) end)
+            end
+            if edge(CONFIG.toggleKey) then
+                state.enabled = not state.enabled
+                safeNotify("Auto-green " .. (state.enabled and "ON" or "OFF"), "matcha", 1.5)
+            end
+            if edge(CONFIG.tuneUpKey)      then CONFIG.target = math.min(1.50, CONFIG.target + 0.001) end
+            if edge(CONFIG.tuneDownKey)    then CONFIG.target = math.max(0.10, CONFIG.target - 0.001) end
+            if edge(CONFIG.tuneCoarseUp)   then CONFIG.target = math.min(1.50, CONFIG.target + 0.01) end
+            if edge(CONFIG.tuneCoarseDown) then CONFIG.target = math.max(0.10, CONFIG.target - 0.01) end
+            if edge(CONFIG.diagKey)        then spawn(function() pcall(diagDump) end) end
+            if edge(CONFIG.closeKey) then
+                state.closed = true
+                for _, d in ipairs(allDrawings) do
+                    pcall(function() d.Visible = false end)
+                    pcall(function() d:Remove() end)
+                end
+                safeNotify("RB5 closed", "matcha", 2)
+                return
+            end
+            wait(0.008)
+        end
+    end)
+end)
+
+-- ─── Live meter readout + HUD paint ────────────────────────────────
+spawn(function()
+    while not state.closed do
+        pcall(function()
+            if not state.busy then state.rawNow = readMeter() end
+            paintHud()
+        end)
+        wait(0.05)
+    end
+end)
+
+safeNotify("RB5 W5 armed · tap E to shoot · target=" .. CONFIG.target, "matcha", 4)
+print("[RB5] armed. target=" .. CONFIG.target)
+print("[RB5] keys: E=shoot · T=toggle · [ ]=tune · M=diag · N=close")
+
+end)  -- end of outer pcall
+
+if not OK then
+    pcall(function()
+        if notify then notify("RB5 boot error: " .. tostring(ERR), "matcha", 8) end
+    end)
+    print("[RB5] BOOT ERROR: " .. tostring(ERR))
+end
