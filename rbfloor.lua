@@ -183,72 +183,68 @@ local function autoGreenShot()
         end
     end)
 
-    -- TRUE peak detection via multi-frame plateau confirmation.
-    -- We require: meter has risen significantly, THEN stayed flat for many
-    -- consecutive frames (not just one tick gap), THEN release.
-    -- Also release on actual decrease (peak passed).
+    -- HYBRID release strategy:
+    --   1. Wait for meter reset (raw < 0.3 → fresh shot)
+    --   2. ENFORCE MIN_HOLD floor: don't release before 0.90s after reset
+    --      → eliminates tick-gap false-plateau early releases at ~0.7
+    --   3. After floor, release on EITHER:
+    --       a. 200ms rolling-window delta ≈ 0 (true plateau)
+    --       b. Meter dropped from all-time peak (apex passed)
+    --       c. 1.50s ceiling
+    --   4. Score at peakSeen for overshoots
 
-    local startedAt    = tick()
-    local releaseAt    = 0
-    local sawReset     = false
-    local peakSeen     = 0
-    local lastRaw      = readMeter()
-    local risingFrames = 0
-    local plateauFrames = 0
-    local everRoseBy   = 0   -- total cumulative rise — must exceed a threshold
+    local MIN_HOLD_SECS = 0.90
+    local MAX_HOLD_SECS = 1.50
+    local PLATEAU_DELTA = 0.005
+
+    local startedAt = tick()
+    local releaseAt = 0
+    local sawReset  = false
+    local resetAt   = nil
+    local peakSeen  = 0
+    local samples   = {}
 
     while not state.closed do
         local raw = readMeter()
         state.rawNow = raw
         state.lastShotMeter = raw
-
         if raw > peakSeen then peakSeen = raw end
 
-        if raw < 0.3 then
+        table.insert(samples, raw)
+        if #samples > 14 then table.remove(samples, 1) end
+
+        if not sawReset and raw < 0.3 then
             sawReset = true
-            risingFrames = 0
-            plateauFrames = 0
-            everRoseBy = 0
+            resetAt  = tick()
             peakSeen = raw
+            samples  = {}
         end
 
         if sawReset then
-            local delta = raw - lastRaw
+            local heldFor = tick() - resetAt
+            if heldFor >= MIN_HOLD_SECS then
+                local windowFlat = false
+                if #samples >= 12 then
+                    local oldest = samples[#samples - 11]
+                    if math.abs(raw - oldest) < PLATEAU_DELTA then
+                        windowFlat = true
+                    end
+                end
+                local apexPassed = peakSeen > 0.4 and raw < peakSeen - 0.015
+                local maxHit = heldFor >= MAX_HOLD_SECS
 
-            if delta > 0.003 then
-                risingFrames = risingFrames + 1
-                plateauFrames = 0
-                everRoseBy = everRoseBy + delta
-            elseif delta < -0.015 then
-                -- meter clearly going DOWN — peak passed, release at peakSeen
-                stopHoldLoop = true
-                -- give the hold loop one tick to exit, then release
-                for _ = 1, 10 do pcall(function() keyrelease(CONFIG.shootKey) end) end
-                releaseAt = peakSeen
-                break
-            else
-                -- meter ~flat
-                plateauFrames = plateauFrames + 1
-            end
-
-            -- Confirmed plateau release: must have meaningfully risen
-            -- AND stayed flat for many consecutive frames AND be at a real high
-            if everRoseBy > 0.5
-               and risingFrames > 6
-               and plateauFrames > 6
-               and raw > peakSeen * 0.97 then
-                stopHoldLoop = true
-                -- give the hold loop one tick to exit, then release
-                for _ = 1, 10 do pcall(function() keyrelease(CONFIG.shootKey) end) end
-                releaseAt = raw
-                break
+                if windowFlat or apexPassed or maxHit then
+                    stopHoldLoop = true
+                    for _ = 1, 10 do pcall(function() keyrelease(CONFIG.shootKey) end) end
+                    releaseAt = apexPassed and peakSeen or raw
+                    break
+                end
             end
         end
 
-        lastRaw = raw
-
         if tick() - startedAt > 3 then
-            for _ = 1, 6 do pcall(function() keyrelease(CONFIG.shootKey) end) end
+            stopHoldLoop = true
+            for _ = 1, 10 do pcall(function() keyrelease(CONFIG.shootKey) end) end
             releaseAt = peakSeen > 0 and peakSeen or raw
             break
         end
