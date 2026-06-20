@@ -73,15 +73,22 @@ end
 -- Locked via B-key autodetect: walks PlayerGui, snapshots Size.X.Scale
 -- + Size.Y.Scale of every Frame, watches while user holds E for a full
 -- shot, whichever Frame's Scale climbed the most is THE bar.
-local barLocked = { frame = nil, axis = nil }
+local barLocked = { frame = nil, axis = nil, minPx = 0, maxPx = 0 }
 
 local function readBarScale()
     if not barLocked.frame or not barLocked.frame.Parent then return nil end
-    local s
-    pcall(function() s = barLocked.frame.Size end)
-    if not s then return nil end
-    if barLocked.axis == "X" then return s.X.Scale end
-    return s.Y.Scale
+    local px
+    if barLocked.axis == "X" then
+        pcall(function() px = barLocked.frame.AbsoluteSize.X end)
+    else
+        pcall(function() px = barLocked.frame.AbsoluteSize.Y end)
+    end
+    if type(px) ~= "number" then return nil end
+    -- Normalize pixel value into 0..1 based on observed range during autodetect
+    local range = barLocked.maxPx - barLocked.minPx
+    if range <= 0 then return nil end
+    local norm = (px - barLocked.minPx) / range
+    return math.max(0, math.min(1.2, norm))
 end
 
 local function readMeter()
@@ -178,7 +185,36 @@ local function barAutoDetect()
     end
     print("[RB5]   " .. tostring(#descendants) .. " descendants")
 
-    print("[RB5] step 4: snapshot Frame sizes")
+    print("[RB5] step 4: probing Size access on one Frame...")
+    local probed = false
+    for _, d in ipairs(descendants) do
+        if probed then break end
+        local cls
+        pcall(function() cls = d.ClassName end)
+        if cls == "Frame" then
+            local sz, ab, tof
+            pcall(function() sz = tostring(d.Size) end)
+            pcall(function() ab = tostring(d.AbsoluteSize) end)
+            pcall(function() tof = typeof and typeof(d.Size) or type(d.Size) end)
+            print("[RB5]   sample Frame: " .. d.Name)
+            print("[RB5]     Size tostring: " .. tostring(sz))
+            print("[RB5]     Size typeof:   " .. tostring(tof))
+            print("[RB5]     AbsoluteSize:  " .. tostring(ab))
+            local xs, ys
+            pcall(function() xs = d.Size.X.Scale end)
+            pcall(function() ys = d.Size.Y.Scale end)
+            print("[RB5]     Size.X.Scale = " .. tostring(xs))
+            print("[RB5]     Size.Y.Scale = " .. tostring(ys))
+            local ax, ay
+            pcall(function() ax = d.AbsoluteSize.X end)
+            pcall(function() ay = d.AbsoluteSize.Y end)
+            print("[RB5]     AbsoluteSize.X = " .. tostring(ax))
+            print("[RB5]     AbsoluteSize.Y = " .. tostring(ay))
+            probed = true
+        end
+    end
+
+    print("[RB5] step 5: snapshot AbsoluteSize (pixels) of every UI instance")
     local snapshots = {}
     local seenInsts = 0
     for _, d in ipairs(descendants) do
@@ -187,34 +223,34 @@ local function barAutoDetect()
         if cls == "Frame" or cls == "ImageLabel" or cls == "ImageButton"
            or cls == "CanvasGroup" or cls == "TextLabel" then
             seenInsts = seenInsts + 1
-            local sX, sY
-            pcall(function() sX = d.Size.X.Scale end)
-            pcall(function() sY = d.Size.Y.Scale end)
-            if type(sX) == "number" then
-                table.insert(snapshots, { frame = d, axis = "X", min = sX, max = sX })
+            local ax, ay
+            pcall(function() ax = d.AbsoluteSize.X end)
+            pcall(function() ay = d.AbsoluteSize.Y end)
+            if type(ax) == "number" then
+                table.insert(snapshots, { frame = d, axis = "X", min = ax, max = ax })
             end
-            if type(sY) == "number" then
-                table.insert(snapshots, { frame = d, axis = "Y", min = sY, max = sY })
+            if type(ay) == "number" then
+                table.insert(snapshots, { frame = d, axis = "Y", min = ay, max = ay })
             end
         end
     end
-    print(string.format("[RB5]   %d UI instances, %d size-sources", seenInsts, #snapshots))
+    print(string.format("[RB5]   %d UI instances, %d AbsoluteSize sources", seenInsts, #snapshots))
 
     if #snapshots == 0 then
-        print("[RB5] FAIL: no Frame sources to track")
+        print("[RB5] FAIL: AbsoluteSize unreadable too")
         return
     end
 
-    print("[RB5] step 5: watching for 2.5s — HOLD E NOW")
+    print("[RB5] step 6: watching for 2.5s — HOLD E NOW")
     local started = tick()
     local pollCount = 0
     while tick() - started < 2.5 do
         for _, snap in ipairs(snapshots) do
             local v
             if snap.axis == "X" then
-                pcall(function() v = snap.frame.Size.X.Scale end)
+                pcall(function() v = snap.frame.AbsoluteSize.X end)
             else
-                pcall(function() v = snap.frame.Size.Y.Scale end)
+                pcall(function() v = snap.frame.AbsoluteSize.Y end)
             end
             if type(v) == "number" then
                 if v > snap.max then snap.max = v end
@@ -226,29 +262,38 @@ local function barAutoDetect()
     end
     print("[RB5]   " .. pollCount .. " polls completed")
 
-    print("[RB5] step 6: ranking")
+    print("[RB5] step 7: ranking by pixel growth")
+    -- AbsoluteSize is in pixels — need bigger threshold (a bar might grow by 200+ px)
     local ranked = {}
     for _, snap in ipairs(snapshots) do
         local amp = snap.max - snap.min
-        if amp > 0.02 then table.insert(ranked, { snap = snap, amp = amp }) end
+        -- compute relative growth (max-min)/max so bars of any pixel size rank fairly
+        local rel = snap.max > 0 and (amp / snap.max) or 0
+        if amp > 5 then  -- at least 5 pixels of movement
+            table.insert(ranked, { snap = snap, amp = amp, rel = rel })
+        end
     end
-    table.sort(ranked, function(a, b) return a.amp > b.amp end)
+    -- rank by relative growth (a bar growing from 10→100 px should beat a window resize)
+    table.sort(ranked, function(a, b) return a.rel > b.rel end)
 
-    print(string.format("[RB5] %d sources moved:", #ranked))
+    print(string.format("[RB5] %d UI sources moved during the shot:", #ranked))
     for i = 1, math.min(15, #ranked) do
         local r = ranked[i]
         local fn = "?"
         pcall(function() fn = r.snap.frame:GetFullName() end)
-        print(string.format("  [%d] %s.Size.%s   %.3f -> %.3f   amp=%.4f",
-            i, fn, r.snap.axis, r.snap.min, r.snap.max, r.amp))
+        print(string.format("  [%d] %s.AbsoluteSize.%s   %.1f -> %.1f px   rel=%.3f",
+            i, fn, r.snap.axis, r.snap.min, r.snap.max, r.rel))
     end
 
-    if ranked[1] and ranked[1].amp > 0.2 then
+    if ranked[1] and ranked[1].rel > 0.3 then
         barLocked.frame = ranked[1].snap.frame
         barLocked.axis  = ranked[1].snap.axis
+        barLocked.minPx = ranked[1].snap.min
+        barLocked.maxPx = ranked[1].snap.max
         local fn = "?"
         pcall(function() fn = ranked[1].snap.frame:GetFullName() end)
-        print(string.format("[RB5] BAR LOCKED: %s.Size.%s  amp=%.3f", fn, ranked[1].snap.axis, ranked[1].amp))
+        print(string.format("[RB5] BAR LOCKED: %s.AbsoluteSize.%s  range=%.1f-%.1f px",
+            fn, ranked[1].snap.axis, ranked[1].snap.min, ranked[1].snap.max))
         safeNotify("Bar locked!", "matcha", 5)
     else
         print("[RB5] no source climbed enough — hold E for the FULL 2.5s next time")
