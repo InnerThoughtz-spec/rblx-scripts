@@ -155,61 +155,104 @@ end
 -- watches 2.5s while user holds E, locks the Frame+axis whose Scale
 -- climbed most.
 local function barAutoDetect()
-    print("[RB5] === BAR AUTODETECT === HOLD E NOW for the full shot")
-    safeNotify("BAR DETECT: HOLD E for the full shot now", "matcha", 4)
+    print("[RB5] === BAR AUTODETECT === HOLD E NOW")
+    safeNotify("BAR DETECT: HOLD E now", "matcha", 4)
 
+    print("[RB5] step 1: getLP")
     local lp = getLP()
-    local gui = lp and lp:FindFirstChild("PlayerGui")
-    if not gui then print("[RB5] no PlayerGui"); return end
+    print("[RB5]   lp = " .. tostring(lp))
+    if not lp then print("[RB5] FAIL: no LocalPlayer"); return end
 
+    print("[RB5] step 2: PlayerGui")
+    local gui
+    local okG = pcall(function() gui = lp:FindFirstChild("PlayerGui") end)
+    print("[RB5]   ok=" .. tostring(okG) .. " gui=" .. tostring(gui))
+    if not gui then print("[RB5] FAIL: no PlayerGui"); return end
+
+    print("[RB5] step 3: GetDescendants")
+    local descendants
+    local okD = pcall(function() descendants = gui:GetDescendants() end)
+    if not okD or not descendants then
+        print("[RB5] FAIL: GetDescendants errored")
+        return
+    end
+    print("[RB5]   " .. tostring(#descendants) .. " descendants")
+
+    print("[RB5] step 4: snapshot Frame sizes")
     local snapshots = {}
-    for _, d in ipairs(gui:GetDescendants()) do
-        if d:IsA("Frame") or d:IsA("ImageLabel") or d:IsA("ImageButton") or d:IsA("CanvasGroup") then
-            local ok, s = pcall(function() return d.Size end)
-            if ok and s then
-                table.insert(snapshots, { frame = d, axis = "X", min = s.X.Scale, max = s.X.Scale })
-                table.insert(snapshots, { frame = d, axis = "Y", min = s.Y.Scale, max = s.Y.Scale })
+    local seenInsts = 0
+    for _, d in ipairs(descendants) do
+        local cls
+        pcall(function() cls = d.ClassName end)
+        if cls == "Frame" or cls == "ImageLabel" or cls == "ImageButton"
+           or cls == "CanvasGroup" or cls == "TextLabel" then
+            seenInsts = seenInsts + 1
+            local sX, sY
+            pcall(function() sX = d.Size.X.Scale end)
+            pcall(function() sY = d.Size.Y.Scale end)
+            if type(sX) == "number" then
+                table.insert(snapshots, { frame = d, axis = "X", min = sX, max = sX })
+            end
+            if type(sY) == "number" then
+                table.insert(snapshots, { frame = d, axis = "Y", min = sY, max = sY })
             end
         end
     end
-    print(string.format("[RB5] tracking %d Frame.Scale sources", #snapshots))
+    print(string.format("[RB5]   %d UI instances, %d size-sources", seenInsts, #snapshots))
 
+    if #snapshots == 0 then
+        print("[RB5] FAIL: no Frame sources to track")
+        return
+    end
+
+    print("[RB5] step 5: watching for 2.5s — HOLD E NOW")
     local started = tick()
+    local pollCount = 0
     while tick() - started < 2.5 do
         for _, snap in ipairs(snapshots) do
-            local ok, s = pcall(function() return snap.frame.Size end)
-            if ok and s then
-                local v = snap.axis == "X" and s.X.Scale or s.Y.Scale
+            local v
+            if snap.axis == "X" then
+                pcall(function() v = snap.frame.Size.X.Scale end)
+            else
+                pcall(function() v = snap.frame.Size.Y.Scale end)
+            end
+            if type(v) == "number" then
                 if v > snap.max then snap.max = v end
                 if v < snap.min then snap.min = v end
             end
         end
+        pollCount = pollCount + 1
         wait(0)
     end
+    print("[RB5]   " .. pollCount .. " polls completed")
 
+    print("[RB5] step 6: ranking")
     local ranked = {}
     for _, snap in ipairs(snapshots) do
         local amp = snap.max - snap.min
-        if amp > 0.05 then table.insert(ranked, { snap = snap, amp = amp }) end
+        if amp > 0.02 then table.insert(ranked, { snap = snap, amp = amp }) end
     end
     table.sort(ranked, function(a, b) return a.amp > b.amp end)
 
-    print(string.format("[RB5] top animated Frame.Scale sources (%d found):", #ranked))
-    for i = 1, math.min(10, #ranked) do
+    print(string.format("[RB5] %d sources moved:", #ranked))
+    for i = 1, math.min(15, #ranked) do
         local r = ranked[i]
-        print(string.format("  %s.Size.%s   %.3f → %.3f   amp=%.3f",
-            r.snap.frame:GetFullName(), r.snap.axis, r.snap.min, r.snap.max, r.amp))
+        local fn = "?"
+        pcall(function() fn = r.snap.frame:GetFullName() end)
+        print(string.format("  [%d] %s.Size.%s   %.3f -> %.3f   amp=%.4f",
+            i, fn, r.snap.axis, r.snap.min, r.snap.max, r.amp))
     end
 
-    if ranked[1] and ranked[1].amp > 0.3 then
+    if ranked[1] and ranked[1].amp > 0.2 then
         barLocked.frame = ranked[1].snap.frame
         barLocked.axis  = ranked[1].snap.axis
-        print(string.format("[RB5] BAR LOCKED: %s.Size.%s  amp=%.3f",
-            ranked[1].snap.frame:GetFullName(), ranked[1].snap.axis, ranked[1].amp))
-        safeNotify("Bar locked: " .. ranked[1].snap.frame.Name .. "." .. ranked[1].snap.axis, "matcha", 5)
+        local fn = "?"
+        pcall(function() fn = ranked[1].snap.frame:GetFullName() end)
+        print(string.format("[RB5] BAR LOCKED: %s.Size.%s  amp=%.3f", fn, ranked[1].snap.axis, ranked[1].amp))
+        safeNotify("Bar locked!", "matcha", 5)
     else
-        print("[RB5] no Frame.Scale climbed convincingly — hold E for the FULL shot next time")
-        safeNotify("Bar detect failed — hold the FULL shot", "matcha", 5)
+        print("[RB5] no source climbed enough — hold E for the FULL 2.5s next time")
+        safeNotify("Bar detect: nothing climbed", "matcha", 5)
     end
 end
 
